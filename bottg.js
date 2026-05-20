@@ -75,16 +75,17 @@ async function handleUpdate(upd) {
                 { role: 'user', content: txt }
             ]
         });
-// 2. Формируем текст с цитатой для размышлений
+// 2. Формируем текст
         const msg = res.choices[0].message;
         let finalMessage = "";
         
         if (msg.reasoning_content) {
-            finalMessage = `> 🧠 *Размышления:* \n> ${msg.reasoning_content.replace(/\n/g, '\n> ')}\n\n`;
+            // Используем обычный Markdown, он менее прихотлив к спецсимволам
+            finalMessage = `🧠 *Размышления:* \n\n${msg.reasoning_content}\n\n*Ответ:*\n\n`;
         }
         finalMessage += msg.content;
         
-        // --- ВОТ ЭТУ СТРОКУ ТЫ ЗАБЫЛ ДОБАВИТЬ ---
+        // ВАЖНО: используем "Markdown", а не "MarkdownV2"
         await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', 
             { 'Content-Type': 'application/json' }, 
             { chat_id: chatId, text: finalMessage, parse_mode: "Markdown" });
