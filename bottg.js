@@ -75,12 +75,23 @@ async function handleUpdate(upd) {
                 { role: 'user', content: txt }
             ]
         });
-
-        const answer = res.choices[0].message.content;
-        await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', { 'Content-Type': 'application/json' }, { chat_id: chatId, text: answer });
+// 2. Формируем текст с цитатой для размышлений
+        const msg = res.choices[0].message;
+        let finalMessage = "";
+        
+        if (msg.reasoning_content) {
+            finalMessage = `> 🧠 *Размышления:* \n> ${msg.reasoning_content.replace(/\n/g, '\n> ')}\n\n`;
+        }
+        finalMessage += msg.content;
+        
+        // --- ВОТ ЭТУ СТРОКУ ТЫ ЗАБЫЛ ДОБАВИТЬ ---
+        await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', 
+            { 'Content-Type': 'application/json' }, 
+            { chat_id: chatId, text: finalMessage, parse_mode: "Markdown" });
+        // ----------------------------------------
         
         chatHistories[chatId].push({ role: 'user', content: txt });
-        chatHistories[chatId].push({ role: 'assistant', content: answer });
+        chatHistories[chatId].push({ role: 'assistant', content: finalMessage });
         if (chatHistories[chatId].length > MAX_HISTORY * 2) chatHistories[chatId] = chatHistories[chatId].slice(-MAX_HISTORY * 2);
         saveHistory();
         console.log("✅ Ответ успешно отправлен.");
