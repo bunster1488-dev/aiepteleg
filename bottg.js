@@ -101,3 +101,10 @@ async function poll() {
 
 console.log("🚀 Бот запущен и готов к работе!");
 poll();
+// Добавь это в конец файла bot.js
+const http = require('http');
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.write('Бот работает!');
+    res.end();
+}).listen(process.env.PORT || 3000);
