@@ -6,9 +6,11 @@
     "start": "node bottg.js"
   },
   "dependencies": {
-    "node-fetch": "^2.6.7"
+    "node-fetch": "^2.6.7",
+    "duck-duck-scrape": "^2.2.3"
   },
   "engines": {
     "node": ">=18.0.0"
   }
 }
+
