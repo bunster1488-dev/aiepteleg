@@ -7,6 +7,8 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const HISTORY_FILE = path.join(__dirname, 'history.json');
 
 let chatHistories = {};
+let processedUpdates = new Set();
+
 if (fs.existsSync(HISTORY_FILE)) {
     try { chatHistories = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch (e) { chatHistories = {}; }
 }
@@ -15,7 +17,6 @@ function saveHistory() {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(chatHistories, null, 2));
 }
 
-// Функция для HTTP запросов
 function makeRequest(url, method = 'POST', headers = {}, body = null) {
     return new Promise((resolve, reject) => {
         const req = https.request(url, { method, headers }, (res) => {
@@ -29,14 +30,12 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
     });
 }
 
-// Функция «ЛУЧШЕГО ПОИСКА» без лишних библиотек
 async function duckDuckGoSearch(query) {
     const encodedQuery = encodeURIComponent(query);
     const url = `https://api.duckduckgo.com/?q=${encodedQuery}&format=json&no_redirect=1&skip_disambig=1`;
     try {
         const data = await makeRequest(url, 'GET', { 'User-Agent': 'Mozilla/5.0' });
-        if (data.AbstractText) return `Результат поиска: ${data.AbstractText} (Источник: ${data.AbstractURL})`;
-        return "Информации в быстром поиске не найдено, попробуй уточнить запрос.";
+        return data.AbstractText ? `Информация из сети: ${data.AbstractText}` : "Нет свежих данных в сети.";
     } catch (e) { return "Ошибка поиска."; }
 }
 
@@ -47,14 +46,11 @@ async function handleUpdate(upd) {
 
     if (!chatHistories[chatId]) chatHistories[chatId] = [];
 
-    let systemPrompt = 'Ты — вежливый помощник Максима. Отвечай всегда со смайликами в дружелюбном стиле.';
-    let userContent = txt;
-
-    // Автоматический поиск, если Макс просит "найди"
-    if (txt.toLowerCase().startsWith('найди ')) {
-        const query = txt.substring(6);
-        const searchResult = await duckDuckGoSearch(query);
-        userContent = `Запрос: "${query}". Данные из интернета: ${searchResult}. Используй это для ответа Максиму.`;
+    // Бот сам решает, нужен ли интернет
+    let finalContent = txt;
+    if (txt.length < 50) { // Если запрос короткий, проверяем, нужен ли поиск
+        const searchRes = await duckDuckGoSearch(txt);
+        finalContent = `Запрос: "${txt}".\n${searchRes}\n\nОтветь на вопрос, перефразировав его для ясности.`;
     }
 
     try {
@@ -64,9 +60,9 @@ async function handleUpdate(upd) {
         }, {
             model: 'deepseek-reasoner',
             messages: [
-                { role: 'system', content: systemPrompt }, 
+                { role: 'system', content: 'Ты — умный помощник Максима. Анализируй запрос: если нужно — ищи в сети, если нет — отвечай своими знаниями. Всегда перефразируй ответ для лучшего понимания. Используй дружелюбный тон и эмодзи.' }, 
                 ...chatHistories[chatId].slice(-10), 
-                { role: 'user', content: userContent }
+                { role: 'user', content: finalContent }
             ]
         });
 
@@ -90,12 +86,18 @@ async function poll() {
     try {
         const res = await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`, 'POST', { 'Content-Type': 'application/json' }, { offset: lastUpdateId + 1, timeout: 30 });
         if (res?.ok && res.result.length > 0) {
-            lastUpdateId = res.result[res.result.length - 1].update_id;
-            for (const u of res.result) await handleUpdate(u);
+            for (const u of res.result) {
+                if (!processedUpdates.has(u.update_id)) {
+                    processedUpdates.add(u.update_id);
+                    lastUpdateId = u.update_id;
+                    await handleUpdate(u);
+                    setTimeout(() => processedUpdates.delete(u.update_id), 60000);
+                }
+            }
         }
     } catch (e) {}
     setTimeout(poll, 1000);
 }
 
 poll();
-require('http').createServer((req, res) => res.end('Бот с поиском работает!')).listen(process.env.PORT || 3000);
+require('http').createServer((req, res) => res.end('Бот готов к работе!')).listen(process.env.PORT || 3000);
