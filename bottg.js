@@ -6,7 +6,13 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 let chatHistories = {};
 let lastProcessedMessage = new Map();
 
-// Универсальный запрос
+// Функция для безопасного экранирования HTML (чтобы код не ломал разметку Телеграма)
+function escapeHtml(text) {
+    if (!text) return "";
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Универсальная функция для запросов
 function makeRequest(url, method = 'POST', headers = {}, body = null) {
     return new Promise((resolve, reject) => {
         const req = https.request(url, { method, headers }, (res) => {
@@ -20,16 +26,42 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
     });
 }
 
-// УЛУЧШЕННЫЙ ПОИСК: Бот ищет в сети перед ответом
-async function performSearch(query) {
-    // Используем поиск DuckDuckGo, но просим больше деталей
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1`;
+// ЗАГРУЗКА ИСТОРИИ ИЗ ТАБЛИЦЫ
+async function loadHistoryFromSheet() {
     try {
-        const res = await makeRequest(url, 'GET');
-        return res.AbstractText || res.RelatedTopics?.[0]?.Text || "Ничего не нашлось.";
-    } catch (e) { return "Ошибка поиска."; }
+        const data = await makeRequest(SHEETDB_URL, 'GET', { 'Content-Type': 'application/json' });
+        if (Array.isArray(data)) {
+            data.forEach(row => {
+                if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
+                chatHistories[row.chatId].push({ role: row.role, content: row.content });
+            });
+            console.log("История загружена из Google Таблицы!");
+        }
+    } catch (e) { console.error("Ошибка загрузки таблицы:", e); }
 }
 
+// МОЩНЫЙ ПОИСК В ИНТЕРНЕТЕ
+async function performSearch(query) {
+    // Используем расширенный поисковый HTML-интерфейс DuckDuckGo без JS, чтобы вытащить реальный текст сайтов
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    try {
+        const html = await makeRequest(url, 'GET', {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        });
+        if (typeof html !== 'string') return "Поиск не дал результатов.";
+        
+        // Вырезаем куски текста из результатов поиска
+        const snippets = [];
+        let match;
+        const regex = /<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+        while ((match = regex.exec(html)) !== null && snippets.length < 3) {
+            snippets.push(match[1].replace(/<[^>]*>/g, '').trim());
+        }
+        return snippets.length > 0 ? snippets.join(" | ") : "Ничего не найдено.";
+    } catch (e) { return "Ошибка поиска в сети."; }
+}
+
+// ОБРАБОТКА ТЕКСТА БОТОМ
 async function handleUpdate(upd) {
     if (!upd.message || !upd.message.text) return;
     const chatId = upd.message.chat.id.toString();
@@ -41,48 +73,70 @@ async function handleUpdate(upd) {
 
     if (!chatHistories[chatId]) chatHistories[chatId] = [];
 
-    // 1. Поиск в сети (если вопрос выглядит как запрос знаний)
+    // 1. Запускаем поиск в фоне
     let context = "";
-    if (txt.length < 100) {
-        const searchResult = await performSearch(txt);
-        context = `Дополнительная информация из сети: ${searchResult}`;
+    const searchResult = await performSearch(txt);
+    if (searchResult && !searchResult.includes("Ошибка")) {
+        context = `Информация из интернета для справки: ${searchResult}\n`;
     }
 
-    // 2. DeepSeek
+    // 2. Запрос в DeepSeek (используем "reasoner", чтобы он выдавал блок мыслей)
     try {
         const res = await makeRequest('https://api.deepseek.com/v1/chat/completions', 'POST', {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
         }, {
-            model: 'deepseek-chat',
+            model: 'deepseek-reasoner', // <-- Оставляем думающую модель, как в твоем коде!
             messages: [
-                { role: 'system', content: `Ты — личный помощник Максима. ${context}` },
+                { role: 'system', content: `Ты — личный умный помощник Максима. Отвечай дружелюбно, используй эмодзи. ${context}` },
                 ...chatHistories[chatId].slice(-10),
                 { role: 'user', content: txt }
             ]
         });
 
-        const finalMessage = res.choices[0].message.content;
+        const aiAnswer = res.choices[0].message.content;
+        const reasoning = res.choices[0].message.reasoning_content; // Получаем мысли ИИ
 
-        // 3. ОТВЕТ С ЦИТИРОВАНИЕМ
+        // 3. ОТПРАВКА МЫСЛЕЙ В РАЗВОРАЧИВАЕМОЙ ЦИТАТЕ
+        if (reasoning) {
+            const formattedReasoning = `<b>🧠 Процесс мышления (нажми, чтобы развернуть):</b>\n<blockquote expandable>${escapeHtml(reasoning)}</blockquote>`;
+            await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', 
+                { 'Content-Type': 'application/json' }, 
+                { 
+                    chat_id: chatId, 
+                    text: formattedReasoning, 
+                    parse_mode: "HTML", // Переключаем на HTML ради цитат!
+                    reply_to_message_id: msgId 
+                });
+        }
+
+        // 4. ОТПРАВКА ФИНАЛЬНОГО ОТВЕТА
         await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', 
             { 'Content-Type': 'application/json' }, 
             { 
                 chat_id: chatId, 
-                text: finalMessage, 
-                parse_mode: "Markdown",
-                reply_parameters: { message_id: msgId } // <-- Красивая цитата
+                text: escapeHtml(aiAnswer), 
+                parse_mode: "HTML",
+                reply_to_message_id: msgId
             });
 
-        // 4. Сохранение в таблицу
+        // 5. СОХРАНЕНИЕ В GOOGLE ТАБЛИЦУ (чтобы бот никогда не забывал)
         await makeRequest(SHEETDB_URL, 'POST', { 'Content-Type': 'application/json' }, {
-            data: [{ chatId: chatId, role: 'user', content: txt }, { chatId: chatId, role: 'assistant', content: finalMessage }]
+            data: [
+                { chatId: chatId, role: 'user', content: txt }, 
+                { chatId: chatId, role: 'assistant', content: aiAnswer }
+            ]
         });
         
         chatHistories[chatId].push({ role: 'user', content: txt });
-        chatHistories[chatId].push({ role: 'assistant', content: finalMessage });
+        chatHistories[chatId].push({ role: 'assistant', content: aiAnswer });
 
-    } catch (e) { console.error(e); }
+    } catch (e) { 
+        console.error("Ошибка бота:", e);
+        await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', 
+            { 'Content-Type': 'application/json' }, 
+            { chat_id: chatId, text: "Ошибка связи с DeepSeek.", reply_to_message_id: msgId });
+    }
 }
 
 async function poll() {
@@ -99,5 +153,8 @@ async function poll() {
 }
 
 let lastUpdateId = 0;
-poll();
-require('http').createServer((req, res) => res.end('Бот живет!')).listen(process.env.PORT || 3000);
+// Сначала загружаем бессмертную память, потом включаем чтение сообщений
+loadHistoryFromSheet().then(() => poll());
+
+// Веб-сервер для Render + UptimeRobot, чтобы бот не уходил в оффлайн
+require('http').createServer((req, res) => res.end('Бот со сворачиваемыми цитатами и поиском активен!')).listen(process.env.PORT || 3000);
