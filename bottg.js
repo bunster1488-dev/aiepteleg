@@ -30,7 +30,7 @@ function cleanMdToHtml(text) {
     const codeBlockRegex = new RegExp('\\x60\\x60\\x60(?:[a-zA-Z]+)?\\n([\\s\\S]*?)\\x60\\x60\\x60', 'g');
     safeText = safeText.replace(codeBlockRegex, '<pre>$1</pre>');
     
-    // 2. Жирный текст **текст** -> <b>текст</b>
+    // 2. Жирный text **текст** -> <b>текст</b>
     safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
     
     // 3. Инлайн код `код` -> <code>код</code> (используем \x60 вместо `)
@@ -125,12 +125,19 @@ async function loadHistoryFromSheet() {
             chatHistories = {};
             // Заполняем историю в хронологическом порядке (так как получили по desc)
             data.reverse().forEach(row => {
-                if (!row.chatId) return;
+                if (!row.chatId || !row.role || !row.content) return;
+                
+                const role = String(row.role).trim();
+                const content = String(row.content).trim();
+                
+                // Жёсткая фильтрация пустых строк, ломающих DeepSeek
+                if (!role || !content) return;
+                
                 if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
-                chatHistories[row.chatId].push({ role: row.role, content: row.content });
+                chatHistories[row.chatId].push({ role, content });
             });
             
-            // Жестко ограничиваем локальный размер кэша
+            // Жестко ограничиваем локальный размер кэша последних 20 сообщений
             Object.keys(chatHistories).forEach(chatId => {
                 if (chatHistories[chatId].length > 20) {
                     chatHistories[chatId] = chatHistories[chatId].slice(-20);
