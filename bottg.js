@@ -21,22 +21,20 @@ function escapeHtml(text) {
     return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Защищенный перевод Markdown в HTML с экранированием содержимого блоков кода
+// Продвинутый перевод Markdown в HTML с поддержкой блоков кода, жирного текста и инлайнового кода
 function cleanMdToHtml(text) {
     if (!text) return "";
-    
-    // Экранируем сначала весь текст, чтобы избежать инъекций HTML
     let safeText = escapeHtml(text);
     
-    // Безопасная обработка блоков кода ```js ... ```
+    // 1. Обработка многострочных блоков кода (используем \x60 вместо ` чтобы не ломать редактор)
     const codeBlockRegex = new RegExp('\\x60\\x60\\x60(?:[a-zA-Z]+)?\\n([\\s\\S]*?)\\x60\\x60\\x60', 'g');
     safeText = safeText.replace(codeBlockRegex, '<pre>$1</pre>');
     
-    // Безопасная замена жирного текста (не жадная, устойчивая к зависаниям ReDoS)
-    safeText = safeText.replace(/\*\*([^*]+?)\*\*/g, '<b>$1</b>');
+    // 2. Жирный текст **текст** -> <b>текст</b>
+    safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
     
-    // Безопасная замена инлайнового кода `код`
-    const inlineCodeRegex = new RegExp('\\x60([^\\x60\\n]+?)\\x60', 'g');
+    // 3. Инлайн код `код` -> <code>код</code> (используем \x60 вместо `)
+    const inlineCodeRegex = new RegExp('\\x60(.*?)\\x60', 'g');
     safeText = safeText.replace(inlineCodeRegex, '<code>$1</code>');
     
     return safeText;
@@ -185,8 +183,7 @@ async function handleUpdate(upd) {
     if (processingChats.has(chatId)) {
         await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, {
             chat_id: chatId,
-            text: "⚠️ Я ещё думаю над твоим прошлым вопросом, подожди немного!",
-            reply_to_message_id: msgId
+            text: "⚠️ Я ещё думаю над твоим прошлым вопросом, подожди немного!"
         });
         return;
     }
@@ -227,26 +224,24 @@ async function handleUpdate(upd) {
         const aiAnswer = res.choices[0].message.content;
         const reasoning = res.choices[0].message.reasoning_content;
 
-        // 1. Отправка процесса размышлений в свернутом блоке
+        // 3. Отправка сворачиваемых мыслей (ИСПРАВЛЕНО: удалён reply_to_message_id)
         if (reasoning) {
             const formattedReasoning = `<b>🧠 Процесс мышления (нажми, чтобы развернуть):</b>\n<blockquote expandable>${escapeHtml(reasoning)}</blockquote>`;
-            await makeRequestWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
+            await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
                 chat_id: chatId, 
                 text: formattedReasoning, 
-                parse_mode: "HTML",
-                reply_to_message_id: msgId 
+                parse_mode: "HTML"
             });
         }
 
-        // 2. Отправка итогового ответа
-        await makeRequestWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
+        // 4. Отправка финального ответа (ИСПРАВЛЕНО: удалён reply_to_message_id)
+        await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
             chat_id: chatId, 
             text: cleanMdToHtml(aiAnswer), 
-            parse_mode: "HTML",
-            reply_to_message_id: msgId
+            parse_mode: "HTML"
         });
 
-        // 3. Сохранение реплик в локальную историю чата
+        // 5. Сохранение реплик в локальную историю чата
         chatHistories[chatId].push({ role: 'user', content: txt });
         chatHistories[chatId].push({ role: 'assistant', content: aiAnswer });
         
@@ -254,7 +249,7 @@ async function handleUpdate(upd) {
             chatHistories[chatId] = chatHistories[chatId].slice(-20);
         }
 
-        // 4. Безопасное сохранение истории в Google Таблицу (фоновое, не блокирует чат)
+        // 6. Запись в SheetDB (асинхронно в фоне)
         makeRequest(SHEETDB_URL, 'POST', {}, {
             data: [
                 { chatId: chatId, role: 'user', content: txt }, 
@@ -272,15 +267,14 @@ async function handleUpdate(upd) {
 
         await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
             chat_id: chatId, 
-            text: errorText, 
-            reply_to_message_id: msgId 
+            text: errorText
         }).catch(err => console.error("Не удалось отправить сообщение об ошибке:", err.message));
     } finally {
         processingChats.delete(chatId); // Разблокируем чат для новых сообщений
     }
 }
 
-// Стабильный цикл долгого опроса (Long Polling)
+// Стабильный лонг-пулинг
 async function poll() {
     try {
         const res = await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=30`, 'GET', {}, null, 35000);
