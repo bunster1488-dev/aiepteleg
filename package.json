@@ -6,8 +6,7 @@
     "start": "node bottg.js"
   },
   "dependencies": {
-    "node-fetch": "^2.6.7",
-    "mongodb": "^6.0.0"
+    "node-fetch": "^2.6.7"
   },
   "engines": {
     "node": ">=18.0.0"
