@@ -106,9 +106,11 @@ async function handleUpdate(upd) {
         if (!chatHistories[chatId]) chatHistories[chatId] = [];
         chatHistories[chatId].push({ role: 'user', content: txt }, { role: 'assistant', content: aiAnswer });
 
-        const importantInfo = (txt.toLowerCase().includes('запомни') || aiAnswer.toLowerCase().includes('дата')) ? aiAnswer.substring(0, 100) : "";
+// ЛОГИКА: ищем "это важно" в конце сообщения (нечувствительно к регистру)
+        const isImportant = /это важно\.?$/i.test(aiAnswer.trim());
+        const importantInfo = isImportant ? aiAnswer.substring(0, 100) : "";
         
-        // ИСПРАВЛЕНО: отправляем в important_fact (колонка E)
+        // Отправка данных в таблицу
         makeRequest(SHEETDB_URL, 'POST', {}, { data: [
             { chatId: chatId, role: 'user', content: txt }, 
             { chatId: chatId, role: 'assistant', content: aiAnswer, important_fact: importantInfo }
