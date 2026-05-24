@@ -69,6 +69,9 @@ async function loadHistoryFromSheet() {
 }
 
 async function handleUpdate(upd) {
+    // ВСТАВЛЯЙ СЮДА:
+    await loadHistoryFromSheet(); 
+    
     if (!upd.message) return;
     const chatId = upd.message.chat.id.toString();
     const msgId = upd.message.message_id;
