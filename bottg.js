@@ -1,4 +1,4 @@
-safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+    safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
     safeText = safeText.replace(/`(.*?)`/g, '<code>$1</code>');
     return safeText;
 }
@@ -57,10 +57,9 @@ async function loadHistoryFromSheet() {
             let facts = [];
             data.forEach(row => {
                 if (row.chatId && row.role && row.content) {
-                    if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
+                    if (!chatHistories[row.chatId]) chatHistories[chatId] = [];
                     chatHistories[row.chatId].push({ role: row.role, content: row.content });
                 }
-                // ИСПРАВЛЕНО: теперь читаем из колонки important_fact (E)
                 if (row.important_fact) facts.push(row.important_fact);
             });
             globalImportantFacts = facts.join(" | ");
@@ -69,8 +68,9 @@ async function loadHistoryFromSheet() {
 }
 
 async function handleUpdate(upd) {
-    // ВСТАВЛЯЙ СЮДА:
-    await loadHistoryFromSheet(); 
+    try {
+        await loadHistoryFromSheet(); 
+    } catch (err) { console.error("Ошибка загрузки:", err); }
     
     if (!upd.message) return;
     const chatId = upd.message.chat.id.toString();
@@ -109,12 +109,10 @@ async function handleUpdate(upd) {
         if (!chatHistories[chatId]) chatHistories[chatId] = [];
         chatHistories[chatId].push({ role: 'user', content: txt }, { role: 'assistant', content: aiAnswer });
 
-// ЛОГИКА: ищем "это важно" в конце сообщения (нечувствительно к регистру)
         const isImportant = /это важно\.?$/i.test(aiAnswer.trim());
         const importantInfo = isImportant ? aiAnswer.substring(0, 100) : "";
         
-        // Отправка данных в таблицу
-        makeRequest(SHEETDB_URL, 'POST', {}, { data: [
+        await makeRequest(SHEETDB_URL, 'POST', {}, { data: [
             { chatId: chatId, role: 'user', content: txt }, 
             { chatId: chatId, role: 'assistant', content: aiAnswer, important_fact: importantInfo }
         ]});
