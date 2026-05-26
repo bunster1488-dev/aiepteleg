@@ -57,7 +57,7 @@ async function loadHistoryFromSheet() {
             let facts = [];
             data.forEach(row => {
                 if (row.chatId && row.role && row.content) {
-                    if (!chatHistories[row.chatId]) chatHistories[chatId] = [];
+                    if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
                     chatHistories[row.chatId].push({ role: row.role, content: row.content });
                 }
                 if (row.important_fact) facts.push(row.important_fact);
@@ -68,9 +68,7 @@ async function loadHistoryFromSheet() {
 }
 
 async function handleUpdate(upd) {
-    try {
-        await loadHistoryFromSheet(); 
-    } catch (err) { console.error("Ошибка загрузки:", err); }
+    try { await loadHistoryFromSheet(); } catch (err) { console.error("Ошибка загрузки:", err); }
     
     if (!upd.message) return;
     const chatId = upd.message.chat.id.toString();
@@ -96,7 +94,7 @@ async function handleUpdate(upd) {
             model: 'deepseek-reasoner',
             messages: [
                 { role: 'system', content: systemPrompt },
-                ...(chatHistories[chatId] || []).slice(-10),
+                ...(chatHistories[chatId] || []).slice(-5),
                 { role: 'user', content: txt }
             ]
         });
