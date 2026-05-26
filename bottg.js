@@ -1,6 +1,20 @@
-    safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
-    safeText = safeText.replace(/`(.*?)`/g, '<code>$1</code>');
-    return safeText;
+const https = require('https');
+const SHEETDB_URL = process.env.SHEETDB_URL;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+
+const PORT = process.env.PORT || 3000;
+require('http').createServer((req, res) => res.end('Бот активен!')).listen(PORT);
+
+const keepAliveAgent = new https.Agent({ keepAlive: true });
+let chatHistories = {};
+let globalImportantFacts = "";
+let lastUpdateId = 0;
+
+function formatAiResponse(text) {
+    // Сворачиваем мысли DeepSeek в красивый HTML блок
+    let formatted = text.replace(/<think>([\s\S]*?)<\/think>/gi, '<details><summary><b>Подумал...</b></summary><i>$1</i></details>');
+    return formatted.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/`(.*?)`/g, '<code>$1</code>');
 }
 
 async function makeRequest(url, method = 'POST', headers = {}, body = null) {
@@ -16,32 +30,6 @@ async function makeRequest(url, method = 'POST', headers = {}, body = null) {
         if (body) req.write(JSON.stringify(body));
         req.end();
     });
-}
-
-async function performSearch(query) {
-    try {
-        const html = await makeRequest(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, 'GET', { 'User-Agent': 'Mozilla/5.0' });
-        const snippets = [];
-        let match, regex = /<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-        while ((match = regex.exec(html)) !== null && snippets.length < 2) {
-            snippets.push(match[1].replace(/<[^>]*>/g, '').trim());
-        }
-        return snippets.join(" | ");
-    } catch (e) { return ""; }
-}
-
-async function getFileContent(fileId) {
-    try {
-        const fileInfo = await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`, 'GET');
-        if (!fileInfo.result?.file_path) return null;
-        return new Promise((resolve) => {
-            https.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`, (res) => {
-                let data = '';
-                res.on('data', (c) => data += c);
-                res.on('end', () => resolve(data));
-            }).on('error', () => resolve(null));
-        });
-    } catch (e) { return null; }
 }
 
 async function loadHistoryFromSheet() {
@@ -60,40 +48,39 @@ async function loadHistoryFromSheet() {
 }
 
 async function handleUpdate(upd) {
-    if (!upd.message) return;
-    try { await loadHistoryFromSheet(); } catch (e) {}
-
+    if (!upd.message || !upd.message.text) return;
     const chatId = upd.message.chat.id.toString();
-    const msgId = upd.message.message_id;
-    let txt = upd.message.text || "";
+    const txt = upd.message.text;
 
-    if (upd.message.document) {
-        const content = await getFileContent(upd.message.document.file_id);
-        if (content) txt = `[Файл]:\n${content}\n\n[Вопрос]: ${txt}`;
-    }
-    if (!txt) return;
+    await loadHistoryFromSheet();
 
-    const searchResult = await performSearch(txt);
-    
     const res = await makeRequest('https://api.deepseek.com/v1/chat/completions', 'POST', {
         'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
     }, {
         model: 'deepseek-reasoner',
         messages: [
-            { role: 'system', content: `Ты помощник Максима. Факты: ${globalImportantFacts}. Поиск: ${searchResult}` },
+            { role: 'system', content: `Ты — помощник. Вечные факты: ${globalImportantFacts}` },
+            ...(chatHistories[chatId] || []).slice(-10),
             { role: 'user', content: txt }
         ]
     });
 
     if (res?.choices) {
         const aiAnswer = res.choices[0].message.content;
+        const formattedAnswer = formatAiResponse(aiAnswer);
+        
         await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
-            chat_id: chatId, text: cleanMdToHtml(aiAnswer), parse_mode: "HTML"
+            chat_id: chatId, text: formattedAnswer, parse_mode: "HTML"
         });
 
-        if (/это важно/i.test(aiAnswer)) {
-            await makeRequest(SHEETDB_URL, 'POST', {}, { data: [{ chatId, role: 'assistant', content: aiAnswer, important_fact: aiAnswer.substring(0, 50) }] });
-        }
+        // Сохраняем историю
+        const isImportant = /это важно\.?$/i.test(aiAnswer.trim());
+        const importantInfo = isImportant ? aiAnswer.substring(0, 100) : "";
+        
+        await makeRequest(SHEETDB_URL, 'POST', {}, { data: [
+            { chatId: chatId, role: 'user', content: txt }, 
+            { chatId: chatId, role: 'assistant', content: aiAnswer, important_fact: importantInfo }
+        ]});
     }
 }
 
@@ -104,4 +91,3 @@ async function poll() {
 }
 
 loadHistoryFromSheet().then(poll);
-require('http').createServer((req, res) => res.end('OK')).listen(process.env.PORT || 3000);
