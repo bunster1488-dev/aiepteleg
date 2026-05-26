@@ -4,32 +4,26 @@
 }
 
 async function makeRequest(url, method = 'POST', headers = {}, body = null) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         const parsedUrl = new URL(url);
-        const options = { hostname: parsedUrl.hostname, path: parsedUrl.pathname + parsedUrl.search, method: method, agent: keepAliveAgent, headers: { ...headers } };
-        if (body && method === 'POST') {
-            body = JSON.stringify(body);
-            options.headers['Content-Type'] = 'application/json';
-            options.headers['Content-Length'] = Buffer.byteLength(body);
-        }
+        const options = { hostname: parsedUrl.hostname, path: parsedUrl.pathname + parsedUrl.search, method: method, agent: keepAliveAgent, headers: { ...headers, 'Content-Type': 'application/json' } };
         const req = https.request(options, (res) => {
             let buf = '';
             res.on('data', d => buf += d);
             res.on('end', () => { try { resolve(JSON.parse(buf)); } catch(e) { resolve(buf); } });
         });
-        req.on('error', reject);
-        if (body) req.write(body);
+        req.on('error', () => resolve(null));
+        if (body) req.write(JSON.stringify(body));
         req.end();
     });
 }
 
 async function performSearch(query) {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     try {
-        const html = await makeRequest(url, 'GET', { 'User-Agent': 'Mozilla/5.0' });
+        const html = await makeRequest(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, 'GET', { 'User-Agent': 'Mozilla/5.0' });
         const snippets = [];
         let match, regex = /<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-        while ((match = regex.exec(html)) !== null && snippets.length < 3) {
+        while ((match = regex.exec(html)) !== null && snippets.length < 2) {
             snippets.push(match[1].replace(/<[^>]*>/g, '').trim());
         }
         return snippets.join(" | ");
@@ -51,32 +45,27 @@ async function getFileContent(fileId) {
 }
 
 async function loadHistoryFromSheet() {
-    try {
-        const data = await makeRequest(SHEETDB_URL, 'GET');
-        if (Array.isArray(data)) {
-            let facts = [];
-            data.forEach(row => {
-                if (row.chatId && row.role && row.content) {
-                    if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
-                    chatHistories[row.chatId].push({ role: row.role, content: row.content });
-                }
-                if (row.important_fact) facts.push(row.important_fact);
-            });
-            globalImportantFacts = facts.join(" | ");
-        }
-    } catch (e) { console.error("Ошибка загрузки:", e); }
+    const data = await makeRequest(SHEETDB_URL, 'GET');
+    if (Array.isArray(data)) {
+        let facts = [];
+        data.forEach(row => {
+            if (row.chatId && row.role && row.content) {
+                if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
+                chatHistories[row.chatId].push({ role: row.role, content: row.content });
+            }
+            if (row.important_fact) facts.push(row.important_fact);
+        });
+        globalImportantFacts = facts.join(" | ");
+    }
 }
 
 async function handleUpdate(upd) {
-    try { await loadHistoryFromSheet(); } catch (err) { console.error("Ошибка загрузки:", err); }
-    
     if (!upd.message) return;
+    try { await loadHistoryFromSheet(); } catch (e) {}
+
     const chatId = upd.message.chat.id.toString();
     const msgId = upd.message.message_id;
     let txt = upd.message.text || "";
-
-    if (lastProcessedMessage.get(chatId) === msgId) return;
-    lastProcessedMessage.set(chatId, msgId);
 
     if (upd.message.document) {
         const content = await getFileContent(upd.message.document.file_id);
@@ -85,45 +74,34 @@ async function handleUpdate(upd) {
     if (!txt) return;
 
     const searchResult = await performSearch(txt);
-    const systemPrompt = `Ты — личный помощник Максима. Вечные факты: ${globalImportantFacts}. Информация из сети: ${searchResult}`;
+    
+    const res = await makeRequest('https://api.deepseek.com/v1/chat/completions', 'POST', {
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+    }, {
+        model: 'deepseek-reasoner',
+        messages: [
+            { role: 'system', content: `Ты помощник Максима. Факты: ${globalImportantFacts}. Поиск: ${searchResult}` },
+            { role: 'user', content: txt }
+        ]
+    });
 
-    try {
-        const res = await makeRequest('https://api.deepseek.com/v1/chat/completions', 'POST', {
-            'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
-        }, {
-            model: 'deepseek-reasoner',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                ...(chatHistories[chatId] || []).slice(-5),
-                { role: 'user', content: txt }
-            ]
-        });
-
+    if (res?.choices) {
         const aiAnswer = res.choices[0].message.content;
         await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, 'POST', {}, { 
-            chat_id: chatId, text: cleanMdToHtml(aiAnswer), parse_mode: "HTML", reply_to_message_id: msgId 
+            chat_id: chatId, text: cleanMdToHtml(aiAnswer), parse_mode: "HTML"
         });
 
-        if (!chatHistories[chatId]) chatHistories[chatId] = [];
-        chatHistories[chatId].push({ role: 'user', content: txt }, { role: 'assistant', content: aiAnswer });
-
-        const isImportant = /это важно\.?$/i.test(aiAnswer.trim());
-        const importantInfo = isImportant ? aiAnswer.substring(0, 100) : "";
-        
-        await makeRequest(SHEETDB_URL, 'POST', {}, { data: [
-            { chatId: chatId, role: 'user', content: txt }, 
-            { chatId: chatId, role: 'assistant', content: aiAnswer, important_fact: importantInfo }
-        ]});
-    } catch (e) { console.error("Ошибка обработки:", e); }
+        if (/это важно/i.test(aiAnswer)) {
+            await makeRequest(SHEETDB_URL, 'POST', {}, { data: [{ chatId, role: 'assistant', content: aiAnswer, important_fact: aiAnswer.substring(0, 50) }] });
+        }
+    }
 }
 
 async function poll() {
-    try {
-        const res = await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=30`, 'GET');
-        if (res?.ok) { for (const u of res.result) { lastUpdateId = u.update_id; await handleUpdate(u); } }
-    } catch (e) {}
+    const res = await makeRequest(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}`, 'GET');
+    if (res?.ok) { for (const u of res.result) { lastUpdateId = u.update_id; await handleUpdate(u); } }
     setTimeout(poll, 1000);
 }
 
-loadHistoryFromSheet().then(() => poll());
-require('http').createServer((req, res) => res.end('Бот активен!')).listen(process.env.PORT || 3000);
+loadHistoryFromSheet().then(poll);
+require('http').createServer((req, res) => res.end('OK')).listen(process.env.PORT || 3000);
