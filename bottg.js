@@ -1,4 +1,4 @@
-const https = require('https');
+\const https = require('https');
 const http = require('http');
 
 const SHEETDB_URL = process.env.SHEETDB_URL;
@@ -25,7 +25,7 @@ let historyLoaded = false;
 function formatAiResponse(text) {
     let formatted = text.replace(
         /<think>([\s\S]*?)<\/think>/gi,
-        '<blockquote><b>🤔 Подумал...</b>\n<i>$1</i></blockquote>'
+        '🧠 <b>Мысли:</b>\n<blockquote expandable><i>$1</i></blockquote>'
     );
     formatted = formatted.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
     formatted = formatted.replace(/`(.*?)`/g, '<code>$1</code>');
