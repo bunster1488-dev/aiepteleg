@@ -241,4 +241,14 @@ server.listen(PORT, async () => {
     await loadHistoryFromSheet();
     await setupWebhook();
     console.log('✅ Бот готов!');
+    startSelfPing();
 });
+
+// Self-ping каждые 10 минут чтобы Render не засыпал
+function startSelfPing() {
+    setInterval(() => {
+        makeRequest(`${RENDER_URL}/`, 'GET')
+            .then(() => console.log('✅ Self-ping OK'))
+            .catch(() => console.log('⚠️ Self-ping failed'));
+    }, 8 * 60 * 1000);
+}
