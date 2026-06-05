@@ -159,11 +159,107 @@ function buildNotionBlocks(blocks) {
     });
 }
 
-async function saveToNotion(userText) {
+// ─── Notion: читаем все страницы из базы ─────────────────────────────────
+async function readNotionPages() {
+    const result = await makeRequest(
+        `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`,
+        'POST',
+        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' },
+        { page_size: 50 }
+    );
+    if (!result?.results) return [];
+    return result.results.map(page => ({
+        id: page.id,
+        title: page.properties?.title?.title?.[0]?.plain_text || 'Без названия',
+        url: page.url
+    }));
+}
+
+// Читаем содержимое конкретной страницы
+async function readNotionPageContent(pageId) {
+    const result = await makeRequest(
+        `https://api.notion.com/v1/blocks/${pageId}/children`,
+        'GET',
+        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' }
+    );
+    if (!result?.results) return '';
+    return result.results.map(block => {
+        const getText = (arr) => arr?.map(t => t.plain_text).join('') || '';
+        switch(block.type) {
+            case 'paragraph': return getText(block.paragraph?.rich_text);
+            case 'heading_1': return '# ' + getText(block.heading_1?.rich_text);
+            case 'heading_2': return '## ' + getText(block.heading_2?.rich_text);
+            case 'heading_3': return '### ' + getText(block.heading_3?.rich_text);
+            case 'bulleted_list_item': return '• ' + getText(block.bulleted_list_item?.rich_text);
+            case 'numbered_list_item': return '1. ' + getText(block.numbered_list_item?.rich_text);
+            case 'callout': return '💡 ' + getText(block.callout?.rich_text);
+            case 'quote': return '"' + getText(block.quote?.rich_text) + '"';
+            default: return '';
+        }
+    }).filter(Boolean).join('\n');
+}
+
+// ─── Notion: умная логика — читать или писать? ────────────────────────────
+async function handleNotion(userText) {
     if (!NOTION_TOKEN || !NOTION_DATABASE_ID) {
         return '❌ Notion не настроен. Добавь NOTION_TOKEN и NOTION_DATABASE_ID в переменные Render.';
     }
 
+    // 1. Читаем все страницы из Notion
+    const pages = await readNotionPages();
+    const pagesList = pages.map(p => `- "${p.title}" (id: ${p.id})`).join('\n');
+
+    // 2. Спрашиваем DeepSeek — есть ли уже релевантная страница?
+    const checkRes = await makeRequest(
+        'https://api.deepseek.com/v1/chat/completions',
+        'POST',
+        { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+        {
+            model: 'deepseek-chat',
+            max_tokens: 100,
+            messages: [
+                {
+                    role: 'system',
+                    content: `Пользователь написал запрос. В Notion есть список страниц. 
+Определи: есть ли страница, которая содержит информацию по теме запроса?
+Если есть — ответь ТОЛЬКО строкой: НАЙДЕНО: <id страницы>
+Если нет — ответь ТОЛЬКО одним словом: НЕТ`
+                },
+                { role: 'user', content: `Запрос: "${userText}"\n\nСтраницы в Notion:\n${pagesList || 'Пусто'}` }
+            ]
+        }
+    );
+
+    const decision = checkRes?.choices?.[0]?.message?.content?.trim() || 'НЕТ';
+    console.log('Notion decision:', decision);
+
+    // 3. Если найдено — читаем и показываем
+    if (decision.startsWith('НАЙДЕНО:')) {
+        const foundId = decision.replace('НАЙДЕНО:', '').trim();
+        const page = pages.find(p => p.id === foundId || foundId.includes(p.id));
+        if (page) {
+            const pageContent = await readNotionPageContent(page.id);
+
+            // Просим DeepSeek красиво пересказать содержимое
+            const summaryRes = await makeRequest(
+                'https://api.deepseek.com/v1/chat/completions',
+                'POST',
+                { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+                {
+                    model: 'deepseek-chat',
+                    max_tokens: 500,
+                    messages: [
+                        { role: 'system', content: 'Кратко и понятно перескажи содержимое заметки из Notion, выдели главное. Отвечай на русском.' },
+                        { role: 'user', content: `Заметка "${page.title}":\n${pageContent}` }
+                    ]
+                }
+            );
+            const summary = summaryRes?.choices?.[0]?.message?.content || pageContent;
+            return `📖 <b>Нашёл в Notion: ${page.title}</b>\n\n${summary}\n\n🔗 ${page.url}`;
+        }
+    }
+
+    // 4. Если не найдено — создаём новую красивую страницу
     const formatted = await formatForNotion(userText);
     if (!formatted) return '❌ Не удалось оформить заметку.';
 
@@ -171,9 +267,7 @@ async function saveToNotion(userText) {
         parent: { database_id: NOTION_DATABASE_ID },
         icon: { type: 'emoji', emoji: formatted.emoji || '📝' },
         properties: {
-            title: {
-                title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }]
-            }
+            title: { title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }] }
         },
         children: buildNotionBlocks(formatted.blocks || [])
     };
@@ -181,10 +275,7 @@ async function saveToNotion(userText) {
     const result = await makeRequest(
         'https://api.notion.com/v1/pages',
         'POST',
-        {
-            'Authorization': `Bearer ${NOTION_TOKEN}`,
-            'Notion-Version': '2022-06-28'
-        },
+        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' },
         body
     );
 
@@ -294,15 +385,15 @@ async function handleUpdate(upd) {
         'POST', {}, { chat_id: chatId, action: 'typing' }
     );
 
-    // 📝 Команда /notion — сохранить в Notion
-    if (txt.startsWith('/notion ') || txt.startsWith('/notion\n')) {
-        const noteText = txt.replace(/^\/notion[\s\n]/, '').trim();
+    // 📝 Команда /notion — умная работа с Notion
+    if (txt.startsWith('/notion ') || txt.startsWith('/notion\n') || txt === '/notion') {
+        const noteText = txt.replace(/^\/notion[\s\n]?/, '').trim();
         if (!noteText) {
-            await sendMessage(chatId, '✏️ Напиши что сохранить: <code>/notion твой текст или идея</code>');
+            await sendMessage(chatId, '✏️ Напиши тему или текст: <code>/notion твой текст или идея</code>\n\nЯ сам пойму — показать что есть в Notion или записать новое.');
             return;
         }
-        await sendMessage(chatId, '⏳ Оформляю и сохраняю в Notion...');
-        const result = await saveToNotion(noteText);
+        await sendMessage(chatId, '🔍 Ищу в Notion...');
+        const result = await handleNotion(noteText);
         await sendMessage(chatId, result);
         return;
     }
@@ -313,7 +404,7 @@ async function handleUpdate(upd) {
             `👋 <b>Привет! Вот что я умею:</b>\n\n` +
             `💬 Просто пиши — я отвечу и запомню важное\n` +
             `🔍 Попроси найти что-то — поищу в интернете\n` +
-            `📝 <code>/notion текст</code> — красиво сохраню в Notion\n` +
+            `📝 <code>/notion текст</code> — ищу в Notion или записываю новое\n` +
             `🧠 Помню последние 10 сообщений + важные факты всегда`
         );
         return;
