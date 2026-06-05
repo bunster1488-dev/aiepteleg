@@ -166,43 +166,38 @@ function formatNotionId(id) {
     return `${clean.slice(0,8)}-${clean.slice(8,12)}-${clean.slice(12,16)}-${clean.slice(16,20)}-${clean.slice(20)}`;
 }
 
-// ─── Notion: читаем страницы (пробуем как БД, потом как страницу) ─────────
-async function readNotionPages() {
-    const pageId = formatNotionId(NOTION_PAGE_ID);
-    const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
+// ─── Notion: поиск страниц через Search API ──────────────────────────────
+async function readNotionPages(query = '') {
+    const notionHeaders = {
+        'Authorization': `Bearer ${NOTION_TOKEN}`,
+        'Notion-Version': '2022-06-28'
+    };
 
-    // Сначала пробуем как database (канбан/таблица)
-    const dbResult = await makeRequest(
-        `https://api.notion.com/v1/databases/${pageId}/query`,
-        'POST', notionHeaders, { page_size: 50 }
+    // Notion Search API — ищет по всем страницам к которым есть доступ
+    const searchBody = { page_size: 30, filter: { value: 'page', property: 'object' } };
+    if (query) searchBody.query = query;
+
+    const result = await makeRequest(
+        'https://api.notion.com/v1/search',
+        'POST', notionHeaders, searchBody
     );
-    if (dbResult?.results) {
-        console.log(`Notion: читаю как database, найдено ${dbResult.results.length} записей`);
-        return dbResult.results.map(page => ({
-            id: page.id,
-            title: page.properties?.title?.title?.[0]?.plain_text
-                || page.properties?.Name?.title?.[0]?.plain_text
-                || 'Без названия',
-            url: page.url
-        }));
+
+    if (!result?.results) {
+        console.log('Notion search failed:', JSON.stringify(result));
+        return [];
     }
 
-    // Если не database — читаем как страницу с дочерними страницами
-    const pageResult = await makeRequest(
-        `https://api.notion.com/v1/blocks/${pageId}/children?page_size=50`,
-        'GET', notionHeaders
-    );
-    if (pageResult?.results) {
-        console.log(`Notion: читаю как page, найдено блоков: ${pageResult.results.length}`);
-        return pageResult.results
-            .filter(b => b.type === 'child_page' || b.type === 'child_database')
-            .map(b => ({
-                id: b.id,
-                title: b.child_page?.title || b.child_database?.title || 'Без названия',
-                url: `https://notion.so/${b.id.replace(/-/g, '')}`
-            }));
-    }
-    return [];
+    const pages = result.results.map(page => {
+        const titleArr = page.properties?.title?.title
+            || page.properties?.Name?.title
+            || page.title  // для обычных страниц
+            || [];
+        const title = titleArr.map(t => t.plain_text).join('') || 'Без названия';
+        return { id: page.id, title, url: page.url };
+    }).filter(p => p.title !== 'Без названия' || true);
+
+    console.log(`Notion search (query="${query}"): найдено ${pages.length} страниц:`, pages.map(p => p.title));
+    return pages;
 }
 
 // Читаем содержимое страницы — включая вложенные toggle блоки
@@ -267,8 +262,8 @@ async function handleNotion(userText) {
     setTimeout(() => notionLocks.delete(lockKey), 30000);
 
     try {
-        // 1. Читаем все страницы из Notion
-        const pages = await readNotionPages();
+        // 1. Ищем страницы в Notion (с запросом для лучшего результата)
+        const pages = await readNotionPages(userText.replace(/[?！]/g, '').trim());
         console.log(`Notion pages found: ${pages.length}`, pages.map(p => p.title));
 
         // 2. Определяем намерение — вопрос или запись?
