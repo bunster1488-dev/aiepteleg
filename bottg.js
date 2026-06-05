@@ -166,26 +166,46 @@ function formatNotionId(id) {
     return `${clean.slice(0,8)}-${clean.slice(8,12)}-${clean.slice(12,16)}-${clean.slice(16,20)}-${clean.slice(20)}`;
 }
 
-// ─── Notion: читаем дочерние страницы из родительской страницы ────────────
+// ─── Notion: читаем страницы (пробуем как БД, потом как страницу) ─────────
 async function readNotionPages() {
     const pageId = formatNotionId(NOTION_PAGE_ID);
-    const result = await makeRequest(
-        `https://api.notion.com/v1/blocks/${pageId}/children?page_size=50`,
-        'GET',
-        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' }
+    const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
+
+    // Сначала пробуем как database (канбан/таблица)
+    const dbResult = await makeRequest(
+        `https://api.notion.com/v1/databases/${pageId}/query`,
+        'POST', notionHeaders, { page_size: 50 }
     );
-    if (!result?.results) return [];
-    // Фильтруем только дочерние страницы
-    return result.results
-        .filter(b => b.type === 'child_page')
-        .map(b => ({
-            id: b.id,
-            title: b.child_page?.title || 'Без названия',
-            url: `https://notion.so/${b.id.replace(/-/g, '')}`
+    if (dbResult?.results) {
+        console.log(`Notion: читаю как database, найдено ${dbResult.results.length} записей`);
+        return dbResult.results.map(page => ({
+            id: page.id,
+            title: page.properties?.title?.title?.[0]?.plain_text
+                || page.properties?.Name?.title?.[0]?.plain_text
+                || 'Без названия',
+            url: page.url
         }));
+    }
+
+    // Если не database — читаем как страницу с дочерними страницами
+    const pageResult = await makeRequest(
+        `https://api.notion.com/v1/blocks/${pageId}/children?page_size=50`,
+        'GET', notionHeaders
+    );
+    if (pageResult?.results) {
+        console.log(`Notion: читаю как page, найдено блоков: ${pageResult.results.length}`);
+        return pageResult.results
+            .filter(b => b.type === 'child_page' || b.type === 'child_database')
+            .map(b => ({
+                id: b.id,
+                title: b.child_page?.title || b.child_database?.title || 'Без названия',
+                url: `https://notion.so/${b.id.replace(/-/g, '')}`
+            }));
+    }
+    return [];
 }
 
-// Читаем содержимое конкретной страницы
+// Читаем содержимое страницы
 async function readNotionPageContent(pageId) {
     const result = await makeRequest(
         `https://api.notion.com/v1/blocks/${pageId}/children`,
@@ -193,8 +213,8 @@ async function readNotionPageContent(pageId) {
         { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' }
     );
     if (!result?.results) return '';
+    const getText = (arr) => arr?.map(t => t.plain_text).join('') || '';
     return result.results.map(block => {
-        const getText = (arr) => arr?.map(t => t.plain_text).join('') || '';
         switch(block.type) {
             case 'paragraph': return getText(block.paragraph?.rich_text);
             case 'heading_1': return '# ' + getText(block.heading_1?.rich_text);
@@ -203,110 +223,137 @@ async function readNotionPageContent(pageId) {
             case 'bulleted_list_item': return '• ' + getText(block.bulleted_list_item?.rich_text);
             case 'numbered_list_item': return '1. ' + getText(block.numbered_list_item?.rich_text);
             case 'callout': return '💡 ' + getText(block.callout?.rich_text);
-            case 'quote': return '"' + getText(block.quote?.rich_text) + '"';
+            case 'quote': return '❝ ' + getText(block.quote?.rich_text);
             default: return '';
         }
     }).filter(Boolean).join('\n');
 }
 
 // ─── Notion: умная логика — читать или писать? ────────────────────────────
+// Защита от двойного запуска
+const notionLocks = new Set();
+
 async function handleNotion(userText) {
     if (!NOTION_TOKEN || !NOTION_PAGE_ID) {
         return '❌ Notion не настроен. Добавь NOTION_TOKEN и NOTION_PAGE_ID в переменные Render.';
     }
 
-    // 1. Читаем все страницы из Notion
-    const pages = await readNotionPages();
-    const pagesList = pages.map(p => `- "${p.title}" (id: ${p.id})`).join('\n');
-
-    // 2. Спрашиваем DeepSeek — есть ли уже релевантная страница?
-    const checkRes = await makeRequest(
-        'https://api.deepseek.com/v1/chat/completions',
-        'POST',
-        { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-        {
-            model: 'deepseek-chat',
-            max_tokens: 100,
-            messages: [
-                {
-                    role: 'system',
-                    content: `Пользователь написал запрос. В Notion есть список страниц. 
-Определи: есть ли страница, которая содержит информацию по теме запроса?
-Если есть — ответь ТОЛЬКО строкой: НАЙДЕНО: <id страницы>
-Если нет — ответь ТОЛЬКО одним словом: НЕТ`
-                },
-                { role: 'user', content: `Запрос: "${userText}"\n\nСтраницы в Notion:\n${pagesList || 'Пусто'}` }
-            ]
-        }
-    );
-
-    const decision = checkRes?.choices?.[0]?.message?.content?.trim() || 'НЕТ';
-    console.log('Notion decision:', decision);
-
-    // 3. Если найдено — читаем и показываем
-    if (decision.startsWith('НАЙДЕНО:')) {
-        const foundId = decision.replace('НАЙДЕНО:', '').trim();
-        const page = pages.find(p => p.id === foundId || foundId.includes(p.id));
-        if (page) {
-            const pageContent = await readNotionPageContent(page.id);
-
-            // Просим DeepSeek красиво пересказать содержимое
-            const summaryRes = await makeRequest(
-                'https://api.deepseek.com/v1/chat/completions',
-                'POST',
-                { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-                {
-                    model: 'deepseek-chat',
-                    max_tokens: 500,
-                    messages: [
-                        { role: 'system', content: 'Кратко и понятно перескажи содержимое заметки из Notion, выдели главное. Отвечай на русском.' },
-                        { role: 'user', content: `Заметка "${page.title}":\n${pageContent}` }
-                    ]
-                }
-            );
-            const summary = summaryRes?.choices?.[0]?.message?.content || pageContent;
-            return `📖 <b>Нашёл в Notion: ${page.title}</b>\n\n${summary}\n\n🔗 ${page.url}`;
-        }
+    // Защита от дублей — если такой же запрос уже обрабатывается
+    const lockKey = userText.trim().toLowerCase();
+    if (notionLocks.has(lockKey)) {
+        console.log('Notion: дубль запроса, игнорирую');
+        return '';
     }
+    notionLocks.add(lockKey);
+    setTimeout(() => notionLocks.delete(lockKey), 30000);
 
-    // 4. Если не найдено — создаём новую красивую страницу
+    try {
+        // 1. Читаем все страницы из Notion
+        const pages = await readNotionPages();
+        console.log(`Notion pages found: ${pages.length}`, pages.map(p => p.title));
+
+        // 2. Определяем намерение — вопрос или запись?
+        const isQuestion = /[?？]/.test(userText) || 
+            /^(что|когда|где|как|кто|сколько|почему|зачем|какой|какая|какие|есть ли|покажи|напомни|расскажи)/i.test(userText.trim());
+
+        console.log(`Notion intent: ${isQuestion ? 'ЧИТАТЬ' : 'ВОЗМОЖНО СОЗДАТЬ'}`);
+
+        if (pages.length === 0 && !isQuestion) {
+            return await createNotionPage(userText);
+        }
+
+        if (pages.length === 0 && isQuestion) {
+            return '📭 В Notion пока нет страниц по этой теме.';
+        }
+
+        // 3. Читаем содержимое ВСЕХ страниц для поиска
+        const pagesWithContent = await Promise.all(pages.map(async p => {
+            const c = await readNotionPageContent(p.id);
+            return { ...p, content: c };
+        }));
+
+        const fullContext = pagesWithContent
+            .map(p => `=== ${p.title} ===\n${p.content || '(пусто)'}`)
+            .join('\n\n');
+
+        // 4. DeepSeek ищет ответ в содержимом и решает
+        const checkRes = await makeRequest(
+            'https://api.deepseek.com/v1/chat/completions',
+            'POST',
+            { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+            {
+                model: 'deepseek-chat',
+                max_tokens: 700,
+                messages: [
+                    {
+                        role: 'system',
+                        content: isQuestion
+                            ? `Пользователь задал вопрос про содержимое Notion. Найди ответ в тексте страниц и ответь кратко и понятно. Укажи из какой страницы взял информацию. Если ответа нет — скажи что не нашёл. Отвечай на русском.`
+                            : `Пользователь хочет что-то записать в Notion. Посмотри есть ли уже страница на эту тему.
+Если есть — ответь: НАЙДЕНО В: [название страницы] — и кратко что там есть.
+Если нет — ответь одним словом: СОЗДАТЬ`
+                    },
+                    { role: 'user', content: `Запрос: "${userText}"\n\nСодержимое Notion:\n${fullContext}` }
+                ]
+            }
+        );
+
+        const answer = checkRes?.choices?.[0]?.message?.content?.trim() || '';
+        console.log('Notion answer:', answer.substring(0, 80));
+
+        // 5. Если вопрос — просто возвращаем ответ
+        if (isQuestion) {
+            const pageRef = pagesWithContent.find(p =>
+                answer.toLowerCase().includes(p.title.toLowerCase().slice(0, 6))
+            );
+            const link = pageRef ? `\n\n🔗 ${pageRef.url}` : '';
+            return `📖 <b>Notion:</b>\n\n${answer}${link}`;
+        }
+
+        // 6. Если запись и уже есть — сообщаем
+        if (answer.startsWith('НАЙДЕНО В:')) {
+            return `📌 ${answer}\n\nЕсли хочешь всё равно создать новую — напиши точнее что именно записать.`;
+        }
+
+        // 7. Создаём новую страницу
+        return await createNotionPage(userText);
+
+    } finally {
+        notionLocks.delete(lockKey);
+    }
+}
+
+async function createNotionPage(userText) {
     const formatted = await formatForNotion(userText);
     if (!formatted) return '❌ Не удалось оформить заметку.';
 
     const pageId = formatNotionId(NOTION_PAGE_ID);
-    const body = {
-        parent: { page_id: pageId },
-        icon: { type: 'emoji', emoji: formatted.emoji || '📝' },
-        properties: {
-            title: { title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }] }
-        },
-        children: buildNotionBlocks(formatted.blocks || [])
-    };
-
     const result = await makeRequest(
         'https://api.notion.com/v1/pages',
         'POST',
         { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' },
-        body
+        {
+            parent: { page_id: pageId },
+            icon: { type: 'emoji', emoji: formatted.emoji || '📝' },
+            properties: {
+                title: { title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }] }
+            },
+            children: buildNotionBlocks(formatted.blocks || [])
+        }
     );
 
     if (result?.id) {
         return `✅ Сохранено в Notion!\n📄 <b>${formatted.title}</b>\n🔗 ${result.url}`;
-    } else {
-        const errMsg = result?.message || result?.code || JSON.stringify(result);
-        console.error('Notion error:', errMsg);
-        // Понятные сообщения об ошибках
-        if (errMsg?.includes('Could not find database')) {
-            return `❌ База данных не найдена.\nПроверь NOTION_PAGE_ID — это 32 символа из URL базы данных.`;
-        }
-        if (errMsg?.includes('API token is invalid') || errMsg?.includes('Unauthorized')) {
-            return `❌ Неверный токен.\nПроверь NOTION_TOKEN — должен начинаться с secret_`;
-        }
-        if (errMsg?.includes('object_not_found') || errMsg?.includes('restricted')) {
-            return `❌ Нет доступа к базе данных.\n\n⚠️ Обязательно: открой базу в Notion → ... → Connections → добавь свою интеграцию!`;
-        }
-        return `❌ Ошибка Notion: ${errMsg}`;
     }
+    const errMsg = result?.message || result?.code || JSON.stringify(result);
+    console.error('Notion create error:', errMsg);
+    if (errMsg?.includes('object_not_found') || errMsg?.includes('restricted')) {
+        return `❌ Нет доступа.\nОткрой страницу в Notion → ... → Connections → добавь интеграцию.`;
+    }
+    if (errMsg?.includes('Unauthorized') || errMsg?.includes('token')) {
+        return `❌ Неверный токен. NOTION_TOKEN должен начинаться с secret_`;
+    }
+    return `❌ Ошибка Notion: ${errMsg}`;
 }
 
 // ─── История из SheetDB ───────────────────────────────────────────────────
