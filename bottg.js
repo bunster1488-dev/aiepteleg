@@ -7,12 +7,12 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const RENDER_URL = process.env.RENDER_URL;
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
-const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID;
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID; // твой Telegram ID
 const PORT = process.env.PORT || 3000;
 
 // Проверка обязательных переменных
-const REQUIRED = { SHEETDB_URL, TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, RENDER_URL, ALLOWED_USER_ID };
+const REQUIRED = { SHEETDB_URL, TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, RENDER_URL, ALLOWED_USER_ID }; // NOTION_TOKEN и NOTION_PAGE_ID необязательны
 const missing = Object.entries(REQUIRED).filter(([,v]) => !v).map(([k]) => k);
 if (missing.length) {
     console.error(`❌ Не заданы переменные: ${missing.join(', ')}`);
@@ -159,20 +159,30 @@ function buildNotionBlocks(blocks) {
     });
 }
 
-// ─── Notion: читаем все страницы из базы ─────────────────────────────────
+// ─── Форматирование ID в UUID (с дефисами) ───────────────────────────────
+function formatNotionId(id) {
+    const clean = id.replace(/-/g, '');
+    if (clean.length !== 32) return id;
+    return `${clean.slice(0,8)}-${clean.slice(8,12)}-${clean.slice(12,16)}-${clean.slice(16,20)}-${clean.slice(20)}`;
+}
+
+// ─── Notion: читаем дочерние страницы из родительской страницы ────────────
 async function readNotionPages() {
+    const pageId = formatNotionId(NOTION_PAGE_ID);
     const result = await makeRequest(
-        `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`,
-        'POST',
-        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' },
-        { page_size: 50 }
+        `https://api.notion.com/v1/blocks/${pageId}/children?page_size=50`,
+        'GET',
+        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' }
     );
     if (!result?.results) return [];
-    return result.results.map(page => ({
-        id: page.id,
-        title: page.properties?.title?.title?.[0]?.plain_text || 'Без названия',
-        url: page.url
-    }));
+    // Фильтруем только дочерние страницы
+    return result.results
+        .filter(b => b.type === 'child_page')
+        .map(b => ({
+            id: b.id,
+            title: b.child_page?.title || 'Без названия',
+            url: `https://notion.so/${b.id.replace(/-/g, '')}`
+        }));
 }
 
 // Читаем содержимое конкретной страницы
@@ -201,8 +211,8 @@ async function readNotionPageContent(pageId) {
 
 // ─── Notion: умная логика — читать или писать? ────────────────────────────
 async function handleNotion(userText) {
-    if (!NOTION_TOKEN || !NOTION_DATABASE_ID) {
-        return '❌ Notion не настроен. Добавь NOTION_TOKEN и NOTION_DATABASE_ID в переменные Render.';
+    if (!NOTION_TOKEN || !NOTION_PAGE_ID) {
+        return '❌ Notion не настроен. Добавь NOTION_TOKEN и NOTION_PAGE_ID в переменные Render.';
     }
 
     // 1. Читаем все страницы из Notion
@@ -263,8 +273,9 @@ async function handleNotion(userText) {
     const formatted = await formatForNotion(userText);
     if (!formatted) return '❌ Не удалось оформить заметку.';
 
+    const pageId = formatNotionId(NOTION_PAGE_ID);
     const body = {
-        parent: { database_id: NOTION_DATABASE_ID },
+        parent: { page_id: pageId },
         icon: { type: 'emoji', emoji: formatted.emoji || '📝' },
         properties: {
             title: { title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }] }
@@ -282,8 +293,19 @@ async function handleNotion(userText) {
     if (result?.id) {
         return `✅ Сохранено в Notion!\n📄 <b>${formatted.title}</b>\n🔗 ${result.url}`;
     } else {
-        console.error('Notion error:', JSON.stringify(result));
-        return '❌ Ошибка сохранения в Notion. Проверь токен и ID базы данных.';
+        const errMsg = result?.message || result?.code || JSON.stringify(result);
+        console.error('Notion error:', errMsg);
+        // Понятные сообщения об ошибках
+        if (errMsg?.includes('Could not find database')) {
+            return `❌ База данных не найдена.\nПроверь NOTION_PAGE_ID — это 32 символа из URL базы данных.`;
+        }
+        if (errMsg?.includes('API token is invalid') || errMsg?.includes('Unauthorized')) {
+            return `❌ Неверный токен.\nПроверь NOTION_TOKEN — должен начинаться с secret_`;
+        }
+        if (errMsg?.includes('object_not_found') || errMsg?.includes('restricted')) {
+            return `❌ Нет доступа к базе данных.\n\n⚠️ Обязательно: открой базу в Notion → ... → Connections → добавь свою интеграцию!`;
+        }
+        return `❌ Ошибка Notion: ${errMsg}`;
     }
 }
 
@@ -431,6 +453,7 @@ async function handleUpdate(upd) {
                 {
                     role: 'system',
                     content: `Ты — умный личный помощник в Telegram. Отвечай на русском языке.
+Сейчас: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau', dateStyle: 'full', timeStyle: 'short' })}
 Важные факты о пользователе (помни всегда): ${globalImportantFacts}
 ${searchContext ? 'Используй результаты поиска для ответа.' : ''}`
                 },
