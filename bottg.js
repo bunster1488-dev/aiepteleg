@@ -205,28 +205,47 @@ async function readNotionPages() {
     return [];
 }
 
-// Читаем содержимое страницы
-async function readNotionPageContent(pageId) {
+// Читаем содержимое страницы — включая вложенные toggle блоки
+async function readNotionPageContent(pageId, depth = 0) {
+    if (depth > 3) return ''; // защита от бесконечной рекурсии
+    const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
     const result = await makeRequest(
-        `https://api.notion.com/v1/blocks/${pageId}/children`,
-        'GET',
-        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' }
+        `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
+        'GET', notionHeaders
     );
     if (!result?.results) return '';
+
     const getText = (arr) => arr?.map(t => t.plain_text).join('') || '';
-    return result.results.map(block => {
+    const indent = '  '.repeat(depth);
+    const lines = [];
+
+    for (const block of result.results) {
+        let line = '';
         switch(block.type) {
-            case 'paragraph': return getText(block.paragraph?.rich_text);
-            case 'heading_1': return '# ' + getText(block.heading_1?.rich_text);
-            case 'heading_2': return '## ' + getText(block.heading_2?.rich_text);
-            case 'heading_3': return '### ' + getText(block.heading_3?.rich_text);
-            case 'bulleted_list_item': return '• ' + getText(block.bulleted_list_item?.rich_text);
-            case 'numbered_list_item': return '1. ' + getText(block.numbered_list_item?.rich_text);
-            case 'callout': return '💡 ' + getText(block.callout?.rich_text);
-            case 'quote': return '❝ ' + getText(block.quote?.rich_text);
-            default: return '';
+            case 'paragraph':           line = getText(block.paragraph?.rich_text); break;
+            case 'heading_1':           line = '# ' + getText(block.heading_1?.rich_text); break;
+            case 'heading_2':           line = '## ' + getText(block.heading_2?.rich_text); break;
+            case 'heading_3':           line = '### ' + getText(block.heading_3?.rich_text); break;
+            case 'bulleted_list_item':  line = '• ' + getText(block.bulleted_list_item?.rich_text); break;
+            case 'numbered_list_item':  line = '→ ' + getText(block.numbered_list_item?.rich_text); break;
+            case 'callout':             line = '💡 ' + getText(block.callout?.rich_text); break;
+            case 'quote':               line = '❝ ' + getText(block.quote?.rich_text); break;
+            case 'toggle':              line = '▶ ' + getText(block.toggle?.rich_text); break;
+            case 'to_do':               line = (block.to_do?.checked ? '✅' : '☐') + ' ' + getText(block.to_do?.rich_text); break;
+            case 'code':                line = getText(block.code?.rich_text); break;
+            default: line = '';
         }
-    }).filter(Boolean).join('\n');
+
+        if (line) lines.push(indent + line);
+
+        // Если у блока есть дети (toggle, bulleted с вложением и т.д.) — читаем рекурсивно
+        if (block.has_children) {
+            const children = await readNotionPageContent(block.id, depth + 1);
+            if (children) lines.push(children);
+        }
+    }
+
+    return lines.filter(Boolean).join('\n');
 }
 
 // ─── Notion: умная логика — читать или писать? ────────────────────────────
