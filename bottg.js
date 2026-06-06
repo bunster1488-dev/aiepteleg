@@ -1,6 +1,7 @@
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const url = require('url');
 const initSqlJs = require('sql.js');
 const ddg = require('duck-duck-scrape');
 const chrono = require('chrono-node');
@@ -95,7 +96,6 @@ async function initDatabase() {
   deleteFactById = db.prepare('DELETE FROM facts WHERE id = ?');
   findFactsByText = db.prepare('SELECT * FROM facts WHERE text LIKE ?');
 
-  // Загружаем факты в кеш
   const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
   if (facts.length && facts[0].values) {
     factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -125,7 +125,6 @@ async function migrateFromSheetDB() {
       }
     }
     saveDatabase();
-    // обновить кеш
     const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
     if (facts.length && facts[0].values) {
       factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -927,6 +926,207 @@ function loadHistoryFromDB(chatId, limit = 30) {
   return reversed.map(row => ({ role: row[2], content: row[3] }));
 }
 
+// ─── Веб‑панель ────────────────────────────────────────────────────────
+const PANEL_TOKEN = process.env.PANEL_TOKEN || 'bunst-8524-588';
+
+function getFactsJSON() {
+  const facts = db.exec('SELECT id, text, ts FROM facts ORDER BY ts DESC');
+  if (!facts.length || !facts[0].values) return [];
+  return facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2] }));
+}
+
+function getRemindersJSON() {
+  const reminders = db.exec('SELECT id, chat_id, message, remind_at FROM reminders ORDER BY remind_at');
+  if (!reminders.length || !reminders[0].values) return [];
+  return reminders[0].values.map(row => ({
+    id: row[0],
+    chat_id: row[1],
+    message: row[2],
+    remind_at: row[3],
+    date: new Date(row[3] * 1000).toLocaleString('ru-RU')
+  }));
+}
+
+function getHistoryJSON(chatId, limit = 50) {
+  const rows = db.exec(`SELECT id, chat_id, role, content, timestamp FROM history WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ${limit}`, { chatId });
+  if (!rows.length || !rows[0].values) return [];
+  return rows[0].values.map(row => ({
+    id: row[0],
+    role: row[2],
+    content: row[3],
+    timestamp: row[4],
+    date: new Date(row[4] * 1000).toLocaleString('ru-RU')
+  }));
+}
+
+function servePanel(req, res) {
+  const parsed = url.parse(req.url, true);
+  const token = parsed.query.token;
+  if (token !== PANEL_TOKEN) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Доступ запрещён. Добавьте ?token=...');
+    return;
+  }
+
+  if (parsed.pathname === '/panel') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(getPanelHTML());
+    return;
+  }
+
+  if (parsed.pathname === '/api/facts') {
+    if (req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(getFactsJSON()));
+    } else if (req.method === 'DELETE') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try {
+          const { id } = JSON.parse(body);
+          db.run('DELETE FROM facts WHERE id = ?', [id]);
+          saveDatabase();
+          const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
+          factsStore = facts[0]?.values?.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null })) || [];
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+    }
+    return;
+  }
+
+  if (parsed.pathname === '/api/reminders') {
+    if (req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(getRemindersJSON()));
+    } else if (req.method === 'DELETE') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try {
+          const { id } = JSON.parse(body);
+          db.run('DELETE FROM reminders WHERE id = ?', [id]);
+          saveDatabase();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+    }
+    return;
+  }
+
+  if (parsed.pathname === '/api/history') {
+    const chatId = parsed.query.chat_id || ALLOWED_USER_ID;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getHistoryJSON(chatId)));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
+}
+
+function getPanelHTML() {
+  return `<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Панель бота</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+    h1 { color: #333; }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+    .tab { padding: 10px 20px; background: #ddd; border-radius: 5px 5px 0 0; cursor: pointer; }
+    .tab.active { background: white; font-weight: bold; }
+    .content { background: white; padding: 20px; border-radius: 0 5px 5px 5px; min-height: 200px; }
+    .item { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #eee; }
+    .item button { background: #e74c3c; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h1>🤖 Панель управления ботом</h1>
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('facts')">Факты</div>
+    <div class="tab" onclick="showTab('reminders')">Напоминания</div>
+    <div class="tab" onclick="showTab('history')">История</div>
+  </div>
+  <div id="facts" class="content"></div>
+  <div id="reminders" class="content hidden"></div>
+  <div id="history" class="content hidden"></div>
+
+  <script>
+    const token = new URLSearchParams(location.search).get('token');
+    const BASE = '/api';
+
+    function showTab(name) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(\`.tab:nth-child(\${['facts','reminders','history'].indexOf(name)+1})\`).classList.add('active');
+      document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
+      document.getElementById(name).classList.remove('hidden');
+      if (name === 'facts') loadFacts();
+      if (name === 'reminders') loadReminders();
+      if (name === 'history') loadHistory();
+    }
+
+    async function loadFacts() {
+      const res = await fetch(\`\${BASE}/facts?token=\${token}\`);
+      const facts = await res.json();
+      document.getElementById('facts').innerHTML = '<h3>Факты</h3>' + facts.map(f =>
+        \`<div class="item"><span>\${escapeHtml(f.text)}</span><button onclick="deleteFact(\${f.id})">Удалить</button></div>\`
+      ).join('');
+    }
+
+    async function deleteFact(id) {
+      await fetch(\`\${BASE}/facts?token=\${token}\`, {
+        method: 'DELETE',
+        body: JSON.stringify({ id })
+      });
+      loadFacts();
+    }
+
+    async function loadReminders() {
+      const res = await fetch(\`\${BASE}/reminders?token=\${token}\`);
+      const rems = await res.json();
+      document.getElementById('reminders').innerHTML = '<h3>Напоминания</h3>' + rems.map(r =>
+        \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">Удалить</button></div>\`
+      ).join('');
+    }
+
+    async function deleteReminder(id) {
+      await fetch(\`\${BASE}/reminders?token=\${token}\`, {
+        method: 'DELETE',
+        body: JSON.stringify({ id })
+      });
+      loadReminders();
+    }
+
+    async function loadHistory() {
+      const res = await fetch(\`\${BASE}/history?token=\${token}\`);
+      const items = await res.json();
+      document.getElementById('history').innerHTML = '<h3>Последние сообщения</h3>' + items.map(i =>
+        \`<div class="item"><b>\${i.role}:</b> \${escapeHtml(i.content).substring(0,100)} <small>\${i.date}</small></div>\`
+      ).join('');
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    showTab('facts');
+  </script>
+</body>
+</html>`;
+}
+
 // ─── Планировщик ──────────────────────────────────────────────────────
 async function getOpenTodosFromNotion(limit = 10) {
   if (!NOTION_TOKEN || !NOTION_PAGE_ID) return [];
@@ -990,6 +1190,11 @@ async function setupWebhook() {
 
 // ─── Сервер ───────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+  if (parsedUrl.pathname.startsWith('/panel') || parsedUrl.pathname.startsWith('/api/')) {
+    return servePanel(req, res);
+  }
+
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Бот активен!');
