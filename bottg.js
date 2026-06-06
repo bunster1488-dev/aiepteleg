@@ -1,7 +1,6 @@
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
-const url = require('url');
 const initSqlJs = require('sql.js');
 const ddg = require('duck-duck-scrape');
 const chrono = require('chrono-node');
@@ -96,6 +95,7 @@ async function initDatabase() {
   deleteFactById = db.prepare('DELETE FROM facts WHERE id = ?');
   findFactsByText = db.prepare('SELECT * FROM facts WHERE text LIKE ?');
 
+  // Загружаем факты в кеш
   const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
   if (facts.length && facts[0].values) {
     factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -125,6 +125,7 @@ async function migrateFromSheetDB() {
       }
     }
     saveDatabase();
+    // обновить кеш
     const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
     if (facts.length && facts[0].values) {
       factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -183,7 +184,7 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
   });
 }
 
-// ─── DeepSeek stream с общим таймаутом ─────────────────────────────────
+// ─── DeepSeek stream ────────────────────────────────────────────────────
 function streamDeepSeek(body, onDelta) {
   return new Promise((resolve) => {
     const url = new URL('https://api.deepseek.com/v1/chat/completions');
@@ -192,7 +193,7 @@ function streamDeepSeek(body, onDelta) {
       path: url.pathname,
       method: 'POST',
       agent: keepAliveAgent,
-      timeout: 25000,   // общий таймаут 25 секунд
+      timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
@@ -639,18 +640,13 @@ async function handleFactsCommand(chatId, text) {
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
-    try {
-      const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
-        chat_id: chatId,
-        text: text.slice(i, i+4000),
-        parse_mode: 'HTML',
-        reply_markup: replyMarkup
-      });
-      if (r && r.ok) lastId = r.result?.message_id || lastId;
-      else log('WARN', 'sendMessage ответ не ok:', JSON.stringify(r).slice(0,100));
-    } catch (e) {
-      log('ERROR', 'sendMessage исключение:', e.message);
-    }
+    const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
+      chat_id: chatId,
+      text: text.slice(i, i+4000),
+      parse_mode: 'HTML',
+      reply_markup: replyMarkup
+    });
+    lastId = r?.result?.message_id || lastId;
   }
   return lastId;
 }
@@ -713,6 +709,7 @@ async function handleUpdate(upd) {
     const chatId = q.message.chat.id.toString();
     const data = q.data;
     await makeRequest(`${TG_API}/answerCallbackQuery`, 'POST', {}, { callback_query_id: q.id });
+
     if (data.startsWith('fact_del_')) {
       const id = parseInt(data.slice('fact_del_'.length));
       db.run('DELETE FROM facts WHERE id = ?', [id]);
@@ -730,14 +727,13 @@ async function handleUpdate(upd) {
   const userId = upd.message.from.id.toString();
   const chatId = upd.message.chat.id.toString();
   const messageId = upd.message.message_id;
-  const text = (upd.message.text || '').trim();
+  const text = upd.message.text || '';
 
   if (userId !== ALLOWED_USER_ID) {
     await sendMessage(chatId, '⛔ Доступ запрещён.');
     return;
   }
 
-  // Rate limit
   const now = Date.now();
   const entry = userRateLimit.get(userId);
   if (entry && now < entry.resetTime && entry.count >= RATE_LIMIT_MAX) {
@@ -758,9 +754,9 @@ async function handleUpdate(upd) {
     return;
   }
 
-  log('INFO', `[${chatId}] ${text}`);
+  log('INFO', `[${chatId}] ${text.substring(0, 60)}`);
 
-  // Реакция (без команд)
+  // Реакция
   if (!text.startsWith('/')) {
     const emoji = decideReaction(text);
     if (emoji) {
@@ -785,37 +781,7 @@ async function handleUpdate(upd) {
     return;
   }
 
-  // ================= КОМАНДЫ (строго с return) =================
-  if (text === '/help' || text === '/start') {
-    const panelUrl = `${RENDER_URL}/panel?token=bunst-8524-588`;
-    const helpText = `👋 Я — твой умный помощник!\n\n` +
-      `💬 Общение: просто пиши, я отвечу и запомню важное.\n` +
-      `⚡️ Реакции: на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
-      `🔍 Поиск: спроси «найди что-то» – поищу в интернете.\n` +
-      `📋 Команды:\n` +
-      `/notion [текст] – поиск или создание заметки в Notion.\n` +
-      `/todo [текст] – добавить задачу в Notion (без ИИ).\n` +
-      `/note [текст] – добавить заметку в Notion (без ИИ).\n` +
-      `/remind [время] [текст] – установить напоминание.\n` +
-      `/facts – показать/управлять фактами памяти (кнопки).\n` +
-      `/facts add [текст] – сохранить факт.\n` +
-      `/facts find [запрос] – найти факты.\n` +
-      `/clear – очистить историю диалога.\n` +
-      `🔗 Ссылки: отправь URL — я сделаю краткую сводку.\n` +
-      `📎 Файлы: отправь фото или документ — загружу в Notion.\n` +
-      `⏰ Автономные задачи: утром (09:00) план дня, вечером (19:00) напоминание о задачах из Notion.\n` +
-      `🌐 Веб-панель: ${panelUrl}`;
-
-    try {
-      const msgId = await sendMessage(chatId, helpText);
-      log('INFO', '/help отправлено успешно, msgId:', msgId);
-    } catch (e) {
-      log('ERROR', 'Ошибка отправки /help:', e.message);
-      await sendMessage(chatId, '⚠️ Не удалось отправить справку.');
-    }
-    return;  // ⬅️ ВАЖНО
-  }
-
+  // Команды
   if (text.startsWith('/remind ')) {
     const parsed = parseReminderTime(text);
     if (parsed) {
@@ -827,27 +793,23 @@ async function handleUpdate(upd) {
     }
     return;
   }
-
   if (text === '/todo' || text.startsWith('/todo ')) {
     const t = text.replace(/^\/todo\s*/, '').trim();
     if (!t) { await sendMessage(chatId, '✏️ /todo текст задачи'); return; }
     await sendMessage(chatId, await quickAddTodo(t));
     return;
   }
-
   if (text === '/note' || text.startsWith('/note ')) {
     const t = text.replace(/^\/note\s*/, '').trim();
     if (!t) { await sendMessage(chatId, '✏️ /note текст заметки'); return; }
     await sendMessage(chatId, await quickAddNote(t));
     return;
   }
-
   if (text.startsWith('/facts')) {
     const res = await handleFactsCommand(chatId, text);
     await sendMessage(chatId, res.text, res.buttons);
     return;
   }
-
   if (text.startsWith('/notion')) {
     const noteText = text.replace(/^\/notion[\s\n]?/, '').trim();
     if (!noteText) {
@@ -858,7 +820,6 @@ async function handleUpdate(upd) {
     await sendMessage(chatId, pageText);
     return;
   }
-
   if (text === '/clear') {
     clearHistory.run(chatId);
     delete chatHistories[chatId];
@@ -866,8 +827,29 @@ async function handleUpdate(upd) {
     await sendMessage(chatId, '🧹 История диалога очищена.');
     return;
   }
+  if (text === '/help' || text === '/start') {
+    const helpText = `👋 <b>Я — твой умный помощник!</b>\n\n` +
+      `💬 <b>Общение:</b> просто пиши, я отвечаю и запоминаю важное.\n` +
+      `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
+      `🔍 <b>Поиск:</b> спроси «найди что-то» – поищу в интернете.\n` +
+      `📋 <b>Команды:</b>\n` +
+      `/notion [текст] – поиск или создание заметки в Notion.\n` +
+      `/todo [текст] – добавить задачу в Notion (без ИИ).\n` +
+      `/note [текст] – добавить заметку в Notion (без ИИ).\n` +
+      `/remind [время] [текст] – установить напоминание.\n` +
+      `/facts – показать/управлять фактами памяти (кнопки).\n` +
+      `/facts add [текст] – сохранить факт.\n` +
+      `/facts find [запрос] – найти факты.\n` +
+      `/facts delete <номер> – удалить факт (через кнопки).\n` +
+      `/clear – очистить историю диалога.\n` +
+      `🔗 <b>Ссылки:</b> отправь URL — я сделаю краткую сводку.\n` +
+      `📎 <b>Файлы:</b> отправь фото или документ — загружу в Notion.\n` +
+      `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о незакрытых задачах из Notion.`;
+    await sendMessage(chatId, helpText);
+    return;
+  }
 
-  // Основной диалог (только если не команда)
+  // Основной диалог
   await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
 
   let searchContext = '';
@@ -945,346 +927,6 @@ function loadHistoryFromDB(chatId, limit = 30) {
   return reversed.map(row => ({ role: row[2], content: row[3] }));
 }
 
-// ─── Веб‑панель ────────────────────────────────────────────────────────
-const PANEL_TOKEN = process.env.PANEL_TOKEN || 'bunst-8524-588';
-
-function getFactsJSON() {
-  const facts = db.exec('SELECT id, text, ts FROM facts ORDER BY ts DESC');
-  if (!facts.length || !facts[0].values) return [];
-  return facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2] }));
-}
-
-function getRemindersJSON() {
-  const reminders = db.exec('SELECT id, chat_id, message, remind_at FROM reminders ORDER BY remind_at');
-  if (!reminders.length || !reminders[0].values) return [];
-  return reminders[0].values.map(row => ({
-    id: row[0],
-    chat_id: row[1],
-    message: row[2],
-    remind_at: row[3],
-    date: new Date(row[3] * 1000).toLocaleString('ru-RU')
-  }));
-}
-
-function getHistoryJSON(chatId, limit = 50) {
-  const rows = db.exec(`SELECT id, chat_id, role, content, timestamp FROM history WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ${limit}`, { chatId });
-  if (!rows.length || !rows[0].values) return [];
-  return rows[0].values.map(row => ({
-    id: row[0],
-    role: row[2],
-    content: row[3],
-    timestamp: row[4],
-    date: new Date(row[4] * 1000).toLocaleString('ru-RU')
-  }));
-}
-
-function servePanel(req, res) {
-  const parsed = url.parse(req.url, true);
-  const token = parsed.query.token;
-  if (token !== PANEL_TOKEN) {
-    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Доступ запрещён. Добавьте ?token=...');
-    return;
-  }
-
-  if (parsed.pathname === '/panel') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(getPanelHTML());
-    return;
-  }
-
-  if (parsed.pathname === '/api/facts') {
-    if (req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(getFactsJSON()));
-    } else if (req.method === 'POST') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
-        try {
-          const { text } = JSON.parse(body);
-          if (!text || !text.trim()) throw new Error('Пустой текст');
-          const success = addFact(text.trim());
-          if (!success) throw new Error('Дубликат');
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
-        } catch (e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-    } else if (req.method === 'DELETE') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
-        try {
-          const { id } = JSON.parse(body);
-          db.run('DELETE FROM facts WHERE id = ?', [id]);
-          saveDatabase();
-          const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
-          factsStore = facts[0]?.values?.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null })) || [];
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
-        } catch (e) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-    }
-    return;
-  }
-
-  if (parsed.pathname === '/api/reminders') {
-    if (req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(getRemindersJSON()));
-    } else if (req.method === 'DELETE') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
-        try {
-          const { id } = JSON.parse(body);
-          db.run('DELETE FROM reminders WHERE id = ?', [id]);
-          saveDatabase();
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
-        } catch (e) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-    }
-    return;
-  }
-
-  if (parsed.pathname === '/api/history') {
-    const chatId = parsed.query.chat_id || ALLOWED_USER_ID;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getHistoryJSON(chatId)));
-    return;
-  }
-
-  res.writeHead(404);
-  res.end('Not found');
-}
-
-function getPanelHTML() {
-  return `<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Панель бота</title>
-  <style>
-    :root {
-      --bg: #1e1e2e;
-      --surface: #2a2a3c;
-      --text: #e0e0e0;
-      --text-secondary: #a0a0b0;
-      --accent: #7c8cf8;
-      --danger: #e74c3c;
-      --border: #3a3a4e;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      padding: 20px;
-      min-height: 100vh;
-    }
-    h1 { font-size: 1.8rem; margin-bottom: 1rem; color: #fff; }
-    .tabs { display: flex; gap: 5px; margin-bottom: 20px; }
-    .tab {
-      padding: 10px 20px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px 8px 0 0;
-      cursor: pointer;
-      color: var(--text-secondary);
-      font-weight: 500;
-      transition: 0.2s;
-    }
-    .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-    .content {
-      background: var(--surface);
-      padding: 20px;
-      border-radius: 0 8px 8px 8px;
-      border: 1px solid var(--border);
-      min-height: 300px;
-    }
-    .hidden { display: none; }
-    .item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .item span { flex: 1; margin-right: 10px; }
-    .item button {
-      background: var(--danger);
-      color: white;
-      border: none;
-      padding: 4px 12px;
-      border-radius: 5px;
-      cursor: pointer;
-      font-size: 0.9rem;
-    }
-    .add-form {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-    .add-form input {
-      flex: 1;
-      padding: 10px 15px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--text);
-      font-size: 1rem;
-    }
-    .add-form button {
-      padding: 10px 20px;
-      border-radius: 8px;
-      border: none;
-      background: var(--accent);
-      color: white;
-      font-weight: bold;
-      cursor: pointer;
-      transition: 0.2s;
-    }
-    .add-form button:hover { opacity: 0.9; }
-    .empty { color: var(--text-secondary); text-align: center; padding: 40px 0; }
-    .history-item { padding: 8px 0; border-bottom: 1px solid var(--border); }
-    .history-role { font-weight: bold; color: var(--accent); text-transform: capitalize; }
-    .history-content { margin: 4px 0 0 10px; color: var(--text); }
-    .history-date { font-size: 0.8rem; color: var(--text-secondary); }
-  </style>
-</head>
-<body>
-  <h1>🤖 Панель управления</h1>
-  <div class="tabs">
-    <div class="tab active" onclick="showTab('facts')">Факты</div>
-    <div class="tab" onclick="showTab('reminders')">Напоминания</div>
-    <div class="tab" onclick="showTab('history')">История</div>
-  </div>
-  <div id="facts" class="content">
-    <div class="add-form">
-      <input id="factInput" type="text" placeholder="Новый факт...">
-      <button onclick="addFact()">➕ Добавить</button>
-    </div>
-    <div id="factList"></div>
-  </div>
-  <div id="reminders" class="content hidden"></div>
-  <div id="history" class="content hidden"></div>
-
-  <script>
-    const token = new URLSearchParams(location.search).get('token');
-    const BASE = '/api';
-
-    function showTab(name) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelector(\`.tab:nth-child(\${['facts','reminders','history'].indexOf(name)+1})\`).classList.add('active');
-      document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
-      document.getElementById(name).classList.remove('hidden');
-      if (name === 'facts') loadFacts();
-      if (name === 'reminders') loadReminders();
-      if (name === 'history') loadHistory();
-    }
-
-    async function addFact() {
-      const input = document.getElementById('factInput');
-      const text = input.value.trim();
-      if (!text) return;
-      try {
-        const res = await fetch(\`\${BASE}/facts?token=\${token}\`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text })
-        });
-        if (!res.ok) { const err = await res.json(); alert(err.error || 'Ошибка'); return; }
-        input.value = '';
-        await loadFacts();
-      } catch (e) { alert('Ошибка сети'); }
-    }
-
-    async function loadFacts() {
-      try {
-        const res = await fetch(\`\${BASE}/facts?token=\${token}\`);
-        const facts = await res.json();
-        const container = document.getElementById('factList');
-        if (!facts.length) {
-          container.innerHTML = '<div class="empty">🧠 Фактов пока нет</div>';
-          return;
-        }
-        container.innerHTML = facts.map(f =>
-          \`<div class="item"><span>\${escapeHtml(f.text)}</span><button onclick="deleteFact(\${f.id})">🗑</button></div>\`
-        ).join('');
-      } catch (e) { console.error(e); }
-    }
-
-    async function deleteFact(id) {
-      await fetch(\`\${BASE}/facts?token=\${token}\`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
-      });
-      loadFacts();
-    }
-
-    async function loadReminders() {
-      const res = await fetch(\`\${BASE}/reminders?token=\${token}\`);
-      const rems = await res.json();
-      const container = document.getElementById('reminders');
-      if (!rems.length) {
-        container.innerHTML = '<div class="empty">⏰ Напоминаний нет</div>';
-        return;
-      }
-      container.innerHTML = rems.map(r =>
-        \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">🗑</button></div>\`
-      ).join('');
-    }
-
-    async function deleteReminder(id) {
-      await fetch(\`\${BASE}/reminders?token=\${token}\`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
-      });
-      loadReminders();
-    }
-
-    async function loadHistory() {
-      try {
-        const res = await fetch(\`\${BASE}/history?token=\${token}\`);
-        const items = await res.json();
-        const container = document.getElementById('history');
-        if (!items.length) {
-          container.innerHTML = '<div class="empty">📭 История пуста</div>';
-          return;
-        }
-        container.innerHTML = items.map(i =>
-          \`<div class="history-item">
-            <span class="history-role">\${i.role}:</span>
-            <div class="history-content">\${escapeHtml(i.content).substring(0,150)}</div>
-            <div class="history-date">\${i.date}</div>
-          </div>\`
-        ).join('');
-      } catch (e) { console.error(e); }
-    }
-
-    function escapeHtml(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }
-
-    showTab('facts');
-  </script>
-</body>
-</html>`;
-}
-
 // ─── Планировщик ──────────────────────────────────────────────────────
 async function getOpenTodosFromNotion(limit = 10) {
   if (!NOTION_TOKEN || !NOTION_PAGE_ID) return [];
@@ -1348,11 +990,6 @@ async function setupWebhook() {
 
 // ─── Сервер ───────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  const parsedUrl = url.parse(req.url, true);
-  if (parsedUrl.pathname.startsWith('/panel') || parsedUrl.pathname.startsWith('/api/')) {
-    return servePanel(req, res);
-  }
-
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Бот активен!');
