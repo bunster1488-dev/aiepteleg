@@ -639,13 +639,18 @@ async function handleFactsCommand(chatId, text) {
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
-    const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
-      chat_id: chatId,
-      text: text.slice(i, i+4000),
-      parse_mode: 'HTML',
-      reply_markup: replyMarkup
-    });
-    lastId = r?.result?.message_id || lastId;
+    try {
+      const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
+        chat_id: chatId,
+        text: text.slice(i, i+4000),
+        parse_mode: 'HTML',
+        reply_markup: replyMarkup
+      });
+      if (r && r.ok) lastId = r.result?.message_id || lastId;
+      else log('WARN', 'Ошибка при отправке сообщения:', r);
+    } catch (e) {
+      log('ERROR', 'Не удалось отправить сообщение:', e.message);
+    }
   }
   return lastId;
 }
@@ -845,8 +850,14 @@ async function handleUpdate(upd) {
       `🔗 <b>Ссылки:</b> отправь URL — я сделаю краткую сводку.\n` +
       `📎 <b>Файлы:</b> отправь фото или документ — загружу в Notion.\n` +
       `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о незакрытых задачах из Notion.\n` +
-      `🌐 <b>Веб-панель:</b> <a href="${panelUrl}">Открыть панель управления</a>`;
-    await sendMessage(chatId, helpText);
+      `🌐 <b>Веб-панель:</b> ${panelUrl}`;
+    try {
+      const msgId = await sendMessage(chatId, helpText);
+      log('INFO', '/help отправлено, msgId:', msgId);
+    } catch (e) {
+      log('ERROR', 'Ошибка отправки /help:', e.message);
+      await sendMessage(chatId, 'Произошла ошибка при отправке помощи.');
+    }
     return;
   }
 
