@@ -96,7 +96,6 @@ async function initDatabase() {
   deleteFactById = db.prepare('DELETE FROM facts WHERE id = ?');
   findFactsByText = db.prepare('SELECT * FROM facts WHERE text LIKE ?');
 
-  // Загружаем факты в кеш
   const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
   if (facts.length && facts[0].values) {
     factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -126,7 +125,6 @@ async function migrateFromSheetDB() {
       }
     }
     saveDatabase();
-    // обновить кеш
     const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
     if (facts.length && facts[0].values) {
       factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -151,13 +149,6 @@ function formatAiResponse(thinking, answer) {
   }
   let ans = escapeHtml(answer).replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/`(.*?)`/g, '<code>$1</code>');
   return res + ans;
-}
-function formatStreamingPreview(thinking, answer) {
-  let out = '';
-  if (thinking && thinking.trim()) out += `🧠 <b>Мысли:</b>\n<blockquote expandable><i>${escapeHtml(thinking.trim())}</i></blockquote>\n\n`;
-  if (answer && answer.trim()) out += escapeHtml(answer.trim());
-  else if (!thinking) out += '…';
-  return out || '🧠 <i>Думаю…</i>';
 }
 
 // ─── HTTP‑запросы ──────────────────────────────────────────────────────
@@ -185,53 +176,32 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
   });
 }
 
-// ─── DeepSeek stream (с таймаутом) ─────────────────────────────────────
-function streamDeepSeek(body, onDelta) {
-  return new Promise((resolve) => {
-    const url = new URL('https://api.deepseek.com/v1/chat/completions');
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      agent: keepAliveAgent,
-      timeout: 25000,   // общий таймаут 25 секунд
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
-      }
-    };
-    const req = https.request(options, (res) => {
-      res.setEncoding('utf8');
-      let buffer = '', reasoning = '', answer = '';
-      res.on('data', (chunk) => {
-        buffer += chunk;
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          const s = line.trim();
-          if (!s.startsWith('data:')) continue;
-          const data = s.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-          try {
-            const json = JSON.parse(data);
-            const delta = json.choices?.[0]?.delta || {};
-            if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
-            if (delta.content) { answer += delta.content; }
-            if (onDelta) onDelta(reasoning, answer);
-          } catch (e) {}
-        }
-      });
-      res.on('end', () => resolve({ reasoning, answer }));
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ reasoning: '', answer: '', timedOut: true });
-    });
-    req.on('error', (e) => { log('ERROR', 'Stream error:', e.message); resolve({ reasoning: '', answer: '' }); });
-    req.write(JSON.stringify({ ...body, stream: true }));
-    req.end();
-  });
+// ─── DeepSeek обычный (непотоковый) запрос ─────────────────────────────
+async function callDeepSeek(messages) {
+  const body = {
+    model: 'deepseek-reasoner',
+    messages,
+    stream: false
+  };
+  log('INFO', 'Запрос к DeepSeek...');
+  const res = await makeRequest(
+    'https://api.deepseek.com/v1/chat/completions',
+    'POST',
+    {
+      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body
+  );
+  if (!res || !res.choices) {
+    log('ERROR', 'DeepSeek ответил невалидным JSON:', JSON.stringify(res).slice(0, 200));
+    return { reasoning: '', answer: '' };
+  }
+  const msg = res.choices[0]?.message || {};
+  const reasoning = msg.reasoning_content || '';
+  const answer = msg.content || '';
+  log('INFO', 'DeepSeek ответ получен. Длина ответа:', answer.length);
+  return { reasoning, answer };
 }
 
 // ─── RAG‑lite факты ────────────────────────────────────────────────────
@@ -590,6 +560,7 @@ async function addBlockToNotionPage(type, url, fileName) {
 
 // ─── Напоминания ────────────────────────────────────────────────────────
 function parseReminderTime(text) {
+  // поддерживает как команду /remind, так и обычный текст
   const clean = text.replace(/^\/remind\s+/, '');
   const results = chrono.parse(clean, new Date(), { forwardDate: true });
   if (results.length > 0) {
@@ -859,7 +830,7 @@ async function handleUpdate(upd) {
     return;
   }
 
-  // Основной диалог (потоковый, с таймаутом)
+  // Основной диалог
   try {
     await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
 
@@ -879,49 +850,17 @@ async function handleUpdate(upd) {
       { role: 'user', content: text + searchContext }
     ];
 
-    // Отправляем сообщение-заглушку и начинаем стримить
-    const init = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, { chat_id: chatId, text: '🧠 <i>Думаю…</i>', parse_mode: 'HTML' });
-    const streamMsgId = init?.result?.message_id || null;
-
-    let lastEditAt = 0, lastShown = '';
-    const tryEdit = async (reasoning, answer) => {
-      if (!streamMsgId) return;
-      const now = Date.now();
-      if (now - lastEditAt < 1500) return;  // троттлинг
-      let text = formatStreamingPreview(reasoning, answer);
-      if (text.length > 4000) text = text.slice(0, 4000) + '…';
-      if (text === lastShown) return;
-      lastEditAt = now;
-      lastShown = text;
-      await editMessage(chatId, streamMsgId, text).catch(() => {});
-    };
-
-    const { reasoning, answer, timedOut } = await streamDeepSeek(
-      { model: 'deepseek-reasoner', messages },
-      (r, a) => { tryEdit(r, a); }
-    );
-
-    if (timedOut) {
-      await editMessage(chatId, streamMsgId, '⚠️ AI не ответил вовремя. Попробуй позже.');
-      return;
-    }
-
+    // Вызываем DeepSeek
+    const { reasoning, answer } = await callDeepSeek(messages);
     if (!answer && !reasoning) {
-      await editMessage(chatId, streamMsgId, '⚠️ Не удалось получить ответ от AI.');
+      await sendMessage(chatId, '⚠️ Не удалось получить ответ от AI.');
       return;
     }
 
-    // Финальный ответ
     const formatted = formatAiResponse(reasoning, answer);
-    const chunks = [];
-    for (let i = 0; i < formatted.length; i += 4000) chunks.push(formatted.slice(i, i+4000));
-    if (streamMsgId) await editMessage(chatId, streamMsgId, chunks[0]);
-    else await sendMessage(chatId, chunks[0]);
-    for (let i = 1; i < chunks.length; i++) {
-      await sendMessage(chatId, chunks[i]);
-    }
+    await sendMessage(chatId, formatted);
 
-    // История
+    // Сохраняем историю
     if (!chatHistories[chatId]) chatHistories[chatId] = [];
     const hist = chatHistories[chatId];
     hist.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
