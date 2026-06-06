@@ -587,6 +587,7 @@ async function addBlockToNotionPage(type, url, fileName) {
 
 // ─── Напоминания ────────────────────────────────────────────────────────
 function parseReminderTime(text) {
+  // поддерживает как команду /remind, так и обычный текст
   const clean = text.replace(/^\/remind\s+/, '');
   const results = chrono.parse(clean, new Date(), { forwardDate: true });
   if (results.length > 0) {
@@ -981,6 +982,7 @@ function servePanel(req, res) {
     return;
   }
 
+  // Факты
   if (parsed.pathname === '/api/facts') {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1022,10 +1024,35 @@ function servePanel(req, res) {
     return;
   }
 
+  // Напоминания (теперь и добавление)
   if (parsed.pathname === '/api/reminders') {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getRemindersJSON()));
+    } else if (req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try {
+          const { text } = JSON.parse(body);
+          if (!text || !text.trim()) throw new Error('Пустой текст');
+          // Используем ту же функцию парсинга, что и для Telegram
+          const parsed = parseReminderTime('/remind ' + text);
+          if (!parsed) throw new Error('Не удалось распознать дату/время');
+          const chatId = ALLOWED_USER_ID; // для веб-панели напоминания создаются от имени владельца
+          db.run('INSERT INTO reminders (chat_id, message, remind_at) VALUES (?, ?, ?)', [
+            chatId,
+            parsed.message,
+            Math.floor(parsed.date.getTime() / 1000)
+          ]);
+          saveDatabase();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, date: parsed.date.toLocaleString('ru-RU'), message: parsed.message }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
     } else if (req.method === 'DELETE') {
       let body = '';
       req.on('data', c => body += c);
@@ -1045,6 +1072,7 @@ function servePanel(req, res) {
     return;
   }
 
+  // История
   if (parsed.pathname === '/api/history') {
     const chatId = parsed.query.chat_id || ALLOWED_USER_ID;
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1165,7 +1193,13 @@ function getPanelHTML() {
     </div>
     <div id="factList"></div>
   </div>
-  <div id="reminders" class="content hidden"></div>
+  <div id="reminders" class="content hidden">
+    <div class="add-form">
+      <input id="reminderText" type="text" placeholder="Например: через 30 минут проверить почту">
+      <button onclick="addReminder()">➕ Добавить</button>
+    </div>
+    <div id="reminderList"></div>
+  </div>
   <div id="history" class="content hidden"></div>
 
   <script>
@@ -1182,6 +1216,7 @@ function getPanelHTML() {
       if (name === 'history') loadHistory();
     }
 
+    // Факты
     async function addFact() {
       const input = document.getElementById('factInput');
       const text = input.value.trim();
@@ -1222,17 +1257,36 @@ function getPanelHTML() {
       loadFacts();
     }
 
+    // Напоминания
+    async function addReminder() {
+      const input = document.getElementById('reminderText');
+      const text = input.value.trim();
+      if (!text) return;
+      try {
+        const res = await fetch(\`\${BASE}/reminders?token=\${token}\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        if (!res.ok) { const err = await res.json(); alert(err.error || 'Ошибка'); return; }
+        input.value = '';
+        await loadReminders();
+      } catch (e) { alert('Ошибка сети'); }
+    }
+
     async function loadReminders() {
-      const res = await fetch(\`\${BASE}/reminders?token=\${token}\`);
-      const rems = await res.json();
-      const container = document.getElementById('reminders');
-      if (!rems.length) {
-        container.innerHTML = '<div class="empty">⏰ Напоминаний нет</div>';
-        return;
-      }
-      container.innerHTML = rems.map(r =>
-        \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">🗑</button></div>\`
-      ).join('');
+      try {
+        const res = await fetch(\`\${BASE}/reminders?token=\${token}\`);
+        const rems = await res.json();
+        const container = document.getElementById('reminderList');
+        if (!rems.length) {
+          container.innerHTML = '<div class="empty">⏰ Напоминаний нет</div>';
+          return;
+        }
+        container.innerHTML = rems.map(r =>
+          \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">🗑</button></div>\`
+        ).join('');
+      } catch (e) { console.error(e); }
     }
 
     async function deleteReminder(id) {
@@ -1244,6 +1298,7 @@ function getPanelHTML() {
       loadReminders();
     }
 
+    // История
     async function loadHistory() {
       try {
         const res = await fetch(\`\${BASE}/history?token=\${token}\`);
