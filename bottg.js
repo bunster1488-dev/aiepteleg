@@ -96,7 +96,6 @@ async function initDatabase() {
   deleteFactById = db.prepare('DELETE FROM facts WHERE id = ?');
   findFactsByText = db.prepare('SELECT * FROM facts WHERE text LIKE ?');
 
-  // Загружаем факты в кеш
   const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
   if (facts.length && facts[0].values) {
     factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -126,7 +125,6 @@ async function migrateFromSheetDB() {
       }
     }
     saveDatabase();
-    // обновить кеш
     const facts = db.exec('SELECT * FROM facts ORDER BY ts DESC');
     if (facts.length && facts[0].values) {
       factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
@@ -151,13 +149,6 @@ function formatAiResponse(thinking, answer) {
   }
   let ans = escapeHtml(answer).replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/`(.*?)`/g, '<code>$1</code>');
   return res + ans;
-}
-function formatStreamingPreview(thinking, answer) {
-  let out = '';
-  if (thinking && thinking.trim()) out += `🧠 <b>Мысли:</b>\n<blockquote expandable><i>${escapeHtml(thinking.trim())}</i></blockquote>\n\n`;
-  if (answer && answer.trim()) out += escapeHtml(answer.trim());
-  else if (!thinking) out += '…';
-  return out || '🧠 <i>Думаю…</i>';
 }
 
 // ─── HTTP‑запросы ──────────────────────────────────────────────────────
@@ -185,50 +176,32 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
   });
 }
 
-// ─── DeepSeek stream ────────────────────────────────────────────────────
-function streamDeepSeek(body, onDelta) {
-  return new Promise((resolve) => {
-    const url = new URL('https://api.deepseek.com/v1/chat/completions');
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      agent: keepAliveAgent,
-      timeout: 30000,
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
-      }
-    };
-    const req = https.request(options, (res) => {
-      res.setEncoding('utf8');
-      let buffer = '', reasoning = '', answer = '';
-      res.on('data', (chunk) => {
-        buffer += chunk;
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          const s = line.trim();
-          if (!s.startsWith('data:')) continue;
-          const data = s.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-          try {
-            const json = JSON.parse(data);
-            const delta = json.choices?.[0]?.delta || {};
-            if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
-            if (delta.content) { answer += delta.content; }
-            if (onDelta) onDelta(reasoning, answer);
-          } catch (e) {}
-        }
-      });
-      res.on('end', () => resolve({ reasoning, answer }));
-    });
-    req.on('timeout', () => { req.destroy(); resolve({ reasoning: '', answer: '' }); });
-    req.on('error', (e) => { log('ERROR', e.message); resolve({ reasoning: '', answer: '' }); });
-    req.write(JSON.stringify({ ...body, stream: true }));
-    req.end();
-  });
+// ─── DeepSeek обычный (непотоковый) запрос ─────────────────────────────
+async function callDeepSeek(messages) {
+  const body = {
+    model: 'deepseek-reasoner',
+    messages,
+    stream: false
+  };
+  log('INFO', 'Запрос к DeepSeek...');
+  const res = await makeRequest(
+    'https://api.deepseek.com/v1/chat/completions',
+    'POST',
+    {
+      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body
+  );
+  if (!res || !res.choices) {
+    log('ERROR', 'DeepSeek ответил невалидным JSON:', JSON.stringify(res).slice(0, 200));
+    return { reasoning: '', answer: '' };
+  }
+  const msg = res.choices[0]?.message || {};
+  const reasoning = msg.reasoning_content || '';
+  const answer = msg.content || '';
+  log('INFO', 'DeepSeek ответ получен. Длина ответа:', answer.length);
+  return { reasoning, answer };
 }
 
 // ─── RAG‑lite факты ────────────────────────────────────────────────────
@@ -651,7 +624,8 @@ async function sendMessage(chatId, text, replyMarkup = null) {
       body.reply_markup = replyMarkup;
     }
     const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, body);
-    lastId = r?.result?.message_id || lastId;
+    if (r && r.ok) lastId = r.result?.message_id || lastId;
+    else log('WARN', 'sendMessage не ok:', JSON.stringify(r).slice(0,200));
   }
   return lastId;
 }
@@ -857,27 +831,36 @@ async function handleUpdate(upd) {
   }
 
   // Основной диалог
-  await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
+  try {
+    await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
 
-  let searchContext = '';
-  if (needsSearch(text)) {
-    const sr = await searchWeb(text);
-    if (sr) searchContext = `\n\nРезультаты поиска:\n${sr}`;
-  }
+    let searchContext = '';
+    if (needsSearch(text)) {
+      const sr = await searchWeb(text);
+      if (sr) searchContext = `\n\nРезультаты поиска:\n${sr}`;
+    }
 
-  const relevant = retrieveRelevantFacts(text);
-  const messages = [
-    {
-      role: 'system',
-      content: `Ты — личный помощник. Сейчас: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau', dateStyle: 'full', timeStyle: 'short' })}. Факты о пользователе: ${relevant || '(нет)'} ${searchContext ? 'Используй результаты поиска для ответа.' : ''}`
-    },
-    ...loadHistoryFromDB(chatId, 10),
-    { role: 'user', content: text + searchContext }
-  ];
+    const relevant = retrieveRelevantFacts(text);
+    const messages = [
+      {
+        role: 'system',
+        content: `Ты — личный помощник. Сейчас: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau', dateStyle: 'full', timeStyle: 'short' })}. Факты о пользователе: ${relevant || '(нет)'} ${searchContext ? 'Используй результаты поиска для ответа.' : ''}`
+      },
+      ...loadHistoryFromDB(chatId, 10),
+      { role: 'user', content: text + searchContext }
+    ];
 
-  const { messageId: streamMsgId, reasoning, answer } = await streamAnswer(chatId, messages);
-  if (answer || reasoning) {
+    // Вызываем DeepSeek
+    const { reasoning, answer } = await callDeepSeek(messages);
+    if (!answer && !reasoning) {
+      await sendMessage(chatId, '⚠️ Не удалось получить ответ от AI.');
+      return;
+    }
+
     const formatted = formatAiResponse(reasoning, answer);
+    await sendMessage(chatId, formatted);
+
+    // Сохраняем историю
     if (!chatHistories[chatId]) chatHistories[chatId] = [];
     const hist = chatHistories[chatId];
     hist.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
@@ -885,45 +868,9 @@ async function handleUpdate(upd) {
     db.run('INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'user', text]);
     db.run('INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'assistant', answer]);
     saveDatabase();
-    await finalizeMessage(chatId, streamMsgId, formatted);
-  } else {
-    if (streamMsgId) await editMessage(chatId, streamMsgId, '⚠️ Ошибка AI.');
-    else await sendMessage(chatId, '⚠️ Ошибка AI.');
-  }
-}
-
-async function streamAnswer(chatId, messages) {
-  const init = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, { chat_id: chatId, text: '🧠 <i>Думаю…</i>', parse_mode: 'HTML' });
-  const messageId = init?.result?.message_id || null;
-
-  let lastEditAt = 0, lastShown = '';
-  const tryEdit = async (reasoning, answer) => {
-    if (!messageId) return;
-    const now = Date.now();
-    if (now - lastEditAt < 1500) return;
-    let text = formatStreamingPreview(reasoning, answer);
-    if (text.length > 4000) text = text.slice(0, 4000) + '…';
-    if (text === lastShown) return;
-    lastEditAt = now;
-    lastShown = text;
-    await editMessage(chatId, messageId, text).catch(() => {});
-  };
-
-  const { reasoning, answer } = await streamDeepSeek(
-    { model: 'deepseek-reasoner', messages },
-    (r, a) => { tryEdit(r, a); }
-  );
-  return { messageId, reasoning, answer };
-}
-
-async function finalizeMessage(chatId, messageId, fullText) {
-  const chunks = [];
-  for (let i = 0; i < fullText.length; i += 4000) chunks.push(fullText.slice(i, i+4000));
-  if (chunks.length === 0) chunks.push('…');
-  if (messageId) await editMessage(chatId, messageId, chunks[0]);
-  else await sendMessage(chatId, chunks[0]);
-  for (let i = 1; i < chunks.length; i++) {
-    await sendMessage(chatId, chunks[i]);
+  } catch (e) {
+    log('ERROR', 'Ошибка в основном диалоге:', e.message);
+    await sendMessage(chatId, '⚠️ Произошла ошибка при обработке запроса.');
   }
 }
 
@@ -1024,7 +971,7 @@ function servePanel(req, res) {
     return;
   }
 
-  // Напоминания (теперь и добавление)
+  // Напоминания
   if (parsed.pathname === '/api/reminders') {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1036,10 +983,9 @@ function servePanel(req, res) {
         try {
           const { text } = JSON.parse(body);
           if (!text || !text.trim()) throw new Error('Пустой текст');
-          // Используем ту же функцию парсинга, что и для Telegram
           const parsed = parseReminderTime('/remind ' + text);
           if (!parsed) throw new Error('Не удалось распознать дату/время');
-          const chatId = ALLOWED_USER_ID; // для веб-панели напоминания создаются от имени владельца
+          const chatId = ALLOWED_USER_ID;
           db.run('INSERT INTO reminders (chat_id, message, remind_at) VALUES (?, ?, ?)', [
             chatId,
             parsed.message,
