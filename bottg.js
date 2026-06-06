@@ -12,583 +12,710 @@ const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID; // твой Telegram ID
 const PORT = process.env.PORT || 3000;
 
 // Проверка обязательных переменных
-const REQUIRED = { SHEETDB_URL, TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, RENDER_URL, ALLOWED_USER_ID }; // NOTION_TOKEN и NOTION_PAGE_ID необязательны
-const missing = Object.entries(REQUIRED).filter(([,v]) => !v).map(([k]) => k);
+const REQUIRED = { SHEETDB_URL, TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, RENDER_URL, ALLOWED_USER_ID };
+const missing = Object.entries(REQUIRED).filter(([, v]) => !v).map(([k]) => k);
 if (missing.length) {
-    console.error(`❌ Не заданы переменные: ${missing.join(', ')}`);
-    process.exit(1);
+  console.error(`❌ Не заданы переменные: ${missing.join(', ')}`);
+  process.exit(1);
 }
 
 const keepAliveAgent = new https.Agent({ keepAlive: true });
+const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 let chatHistories = {};
 let globalImportantFacts = "";
 let historyLoaded = false;
 
 // ─── Форматирование ответа для Telegram ──────────────────────────────────
-function formatAiResponse(thinkingText, answerText) {
-    let result = '';
-    if (thinkingText && thinkingText.trim()) {
-        const cleanThinking = thinkingText.trim()
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        result += `🧠 <b>Мысли:</b>\n<blockquote expandable><i>${cleanThinking}</i></blockquote>\n\n`;
-    }
-    let answer = answerText
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
-        .replace(/`(.*?)`/g, '<code>$1</code>');
-    result += answer;
-    return result;
+function escapeHtml(s) {
+  return (s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-// ─── HTTP запросы ─────────────────────────────────────────────────────────
+function formatAiResponse(thinkingText, answerText) {
+  let result = '';
+  if (thinkingText && thinkingText.trim()) {
+    const cleanThinking = escapeHtml(thinkingText.trim());
+    result += `🧠 <b>Мысли:</b>\n<blockquote expandable><i>${cleanThinking}</i></blockquote>\n\n`;
+  }
+  let answer = escapeHtml(answerText)
+    .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+    .replace(/`(.*?)`/g, '<code>$1</code>');
+  result += answer;
+  return result;
+}
+
+// Безопасный предпросмотр во время стрима (без markdown→HTML, чтобы не ломать теги)
+function formatStreamingPreview(thinkingText, answerText) {
+  let out = '';
+  if (thinkingText && thinkingText.trim()) {
+    out += `🧠 <b>Мысли:</b>\n<blockquote expandable><i>${escapeHtml(thinkingText.trim())}</i></blockquote>\n\n`;
+  }
+  if (answerText && answerText.trim()) out += escapeHtml(answerText.trim());
+  else if (!thinkingText) out += '…';
+  return out || '🧠 <i>Думаю…</i>';
+}
+
+// ─── HTTP запросы (буферизованные) ────────────────────────────────────────
 function makeRequest(url, method = 'POST', headers = {}, body = null) {
-    return new Promise((resolve) => {
-        let parsedUrl;
-        try { parsedUrl = new URL(url); } catch(e) { console.error('Bad URL:', url); return resolve(null); }
-        const options = {
-            hostname: parsedUrl.hostname,
-            path: parsedUrl.pathname + parsedUrl.search,
-            method,
-            agent: keepAliveAgent,
-            headers: { 'Content-Type': 'application/json', ...headers }
-        };
-        const req = https.request(options, (res) => {
-            let buf = '';
-            res.on('data', d => buf += d);
-            res.on('end', () => { try { resolve(JSON.parse(buf)); } catch(e) { resolve(buf); } });
-        });
-        req.on('error', (e) => { console.error('Request error:', e.message); resolve(null); });
-        if (body) req.write(JSON.stringify(body));
-        req.end();
+  return new Promise((resolve) => {
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch (e) { console.error('Bad URL:', url); return resolve(null); }
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method,
+      agent: keepAliveAgent,
+      headers: { 'Content-Type': 'application/json', ...headers }
+    };
+    const req = https.request(options, (res) => {
+      let buf = '';
+      res.on('data', d => buf += d);
+      res.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); } });
     });
+    req.on('error', (e) => { console.error('Request error:', e.message); resolve(null); });
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+// ─── DeepSeek: потоковый запрос (stream responses) ────────────────────────
+// onDelta(reasoning, answer) вызывается по мере прихода чанков.
+function streamDeepSeek(body, onDelta) {
+  return new Promise((resolve) => {
+    const url = new URL('https://api.deepseek.com/v1/chat/completions');
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      agent: keepAliveAgent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+      }
+    };
+    const req = https.request(options, (res) => {
+      res.setEncoding('utf8');
+      let buffer = '';
+      let reasoning = '';
+      let answer = '';
+      res.on('data', (chunk) => {
+        buffer += chunk;
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // последняя строка может быть неполной
+        for (const line of lines) {
+          const s = line.trim();
+          if (!s.startsWith('data:')) continue;
+          const data = s.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const json = JSON.parse(data);
+            const delta = json.choices?.[0]?.delta || {};
+            let changed = false;
+            if (delta.reasoning_content) { reasoning += delta.reasoning_content; changed = true; }
+            if (delta.content) { answer += delta.content; changed = true; }
+            if (changed && onDelta) onDelta(reasoning, answer);
+          } catch (e) { /* пропускаем битый чанк */ }
+        }
+      });
+      res.on('end', () => resolve({ reasoning, answer }));
+    });
+    req.on('error', (e) => { console.error('Stream error:', e.message); resolve({ reasoning: '', answer: '' }); });
+    req.write(JSON.stringify({ ...body, stream: true }));
+    req.end();
+  });
+}
+
+// ─── Реакции вместо ответа (без затрат токенов) ───────────────────────────
+// Только разрешённые Telegram эмодзи-реакции.
+function decideReaction(text) {
+  const t = (text || '').toLowerCase().trim();
+  if (!t || t.length > 60) return null;          // реагируем только на короткое
+  if (t.startsWith('/')) return null;            // команды
+  if (/[?？]/.test(t)) return null;              // вопросы — отвечаем текстом
+  if (needsSearch(t)) return null;               // просьба найти — отвечаем текстом
+
+  const rules = [
+    { test: /(я дома|дома уже|доехал|добрался|приехал|я на месте|вернулся)/, set: ['👍', '🤗', '❤️'] },
+    { test: /(я рад|рад|ура|круто|здорово|класс|супер|отлично|победа|получилось|сдал|успех|топ)/, set: ['🎉', '🥰', '🔥', '👏', '😍'] },
+    { test: /(люблю|любовь|скучаю|целую|обнимаю)/, set: ['❤️', '😘', '🥰', '❤️‍🔥'] },
+    { test: /(спасибо|благодарю|thx|thanks|пасиб)/, set: ['🙏', '👍', '🤝'] },
+    { test: /(устал|вымотан|спать|сплю|ложусь|выдохся|спокойной ночи)/, set: ['🫡', '😴', '🤝'] },
+    { test: /(грустно|плохо|печаль|расстроен|обидно|болею|заболел)/, set: ['❤️', '😭', '🙏'] },
+    { test: /(смешно|ахах|хаха|лол|ржу|🤣|😂|😅)/, set: ['🤣', '😁'] },
+    { test: /^(ок|окей|окей\.|хорошо|понял|поняла|принято|договорились|ладно|идёт|идет|плюс|\+)$/, set: ['👍', '👌', '🫡'] },
+    { test: /(доброе утро|добрый вечер|добрый день|привет|здарова|хай)/, set: ['🤗', '😁', '👌'] },
+    { test: /(работаю|занят|в пути|еду|выехал|на работе)/, set: ['🫡', '👍', '⚡️'] },
+  ];
+
+  for (const r of rules) {
+    if (r.test.test(t)) return r.set[Math.floor(Math.random() * r.set.length)];
+  }
+  return null;
+}
+
+async function setReaction(chatId, messageId, emoji) {
+  return makeRequest(
+    `${TG_API}/setMessageReaction`,
+    'POST', {},
+    { chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] }
+  );
 }
 
 // ─── Поиск через duck-duck-scrape ─────────────────────────────────────────
 async function searchWeb(query) {
-    try {
-        const results = await ddg.search(query, { safeSearch: ddg.SafeSearchType.MODERATE });
-        if (!results || !results.results || results.results.length === 0) return null;
-        return results.results.slice(0, 4)
-            .map(r => `📌 ${r.title}\n${r.description}`)
-            .join('\n\n');
-    } catch(e) {
-        console.error('Search error:', e.message);
-        return null;
-    }
+  try {
+    const results = await ddg.search(query, { safeSearch: ddg.SafeSearchType.MODERATE });
+    if (!results || !results.results || results.results.length === 0) return null;
+    return results.results.slice(0, 4)
+      .map(r => `📌 ${r.title}\n${r.description}`)
+      .join('\n\n');
+  } catch (e) {
+    console.error('Search error:', e.message);
+    return null;
+  }
 }
 
 function needsSearch(text) {
-    const triggers = [
-        'найди', 'поищи', 'погугли', 'что такое', 'кто такой', 'кто такая',
-        'расскажи про', 'расскажи о', 'узнай', 'сколько стоит', 'где находится',
-        'последние новости', 'новости про', 'что случилось',
-        'курс ', 'погода', 'price', 'search', 'find', 'what is', 'who is'
-    ];
-    return triggers.some(t => text.toLowerCase().includes(t));
+  const triggers = [
+    'найди', 'поищи', 'погугли', 'что такое', 'кто такой', 'кто такая',
+    'расскажи про', 'расскажи о', 'узнай', 'сколько стоит', 'где находится',
+    'последние новости', 'новости про', 'что случилось',
+    'курс ', 'погода', 'price', 'search', 'find', 'what is', 'who is'
+  ];
+  return triggers.some(t => text.toLowerCase().includes(t));
 }
 
 // ─── Notion: создание красивой страницы ───────────────────────────────────
 async function formatForNotion(userText) {
-    // Просим DeepSeek красиво оформить содержимое в JSON для Notion
-    const res = await makeRequest(
-        'https://api.deepseek.com/v1/chat/completions',
-        'POST',
-        { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+  const res = await makeRequest(
+    'https://api.deepseek.com/v1/chat/completions',
+    'POST',
+    { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+    {
+      model: 'deepseek-chat',
+      max_tokens: 1000,
+      messages: [
         {
-            model: 'deepseek-chat',
-            max_tokens: 1000,
-            messages: [
-                {
-                    role: 'system',
-                    content: `Ты оформляешь заметки для Notion. Получаешь текст от пользователя и возвращаешь ТОЛЬКО валидный JSON без markdown-обёртки.
-Формат ответа:
-{
-  "title": "Краткий заголовок страницы",
-  "emoji": "подходящий эмодзи",
-  "blocks": [
-    { "type": "heading_2", "text": "Раздел" },
-    { "type": "paragraph", "text": "Текст абзаца" },
-    { "type": "bulleted_list_item", "text": "Пункт списка" },
-    { "type": "callout", "text": "Важная заметка", "emoji": "💡" },
-    { "type": "quote", "text": "Цитата или ключевая мысль" },
-    { "type": "divider" }
-  ]
-}
-Используй разные типы блоков для красивого оформления. Структурируй информацию логично.`
-                },
-                { role: 'user', content: userText }
-            ]
-        }
-    );
-
-    if (!res?.choices) return null;
-    try {
-        const raw = res.choices[0].message.content.trim()
-            .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '');
-        return JSON.parse(raw);
-    } catch(e) {
-        console.error('Notion JSON parse error:', e.message);
-        return null;
+          role: 'system',
+          content: `Ты оформляешь заметки для Notion. Получаешь текст от пользователя и возвращаешь ТОЛЬКО валидный JSON без markdown-обёртки. Формат ответа: { "title": "Краткий заголовок страницы", "emoji": "подходящий эмодзи", "blocks": [ { "type": "heading_2", "text": "Раздел" }, { "type": "paragraph", "text": "Текст абзаца" }, { "type": "bulleted_list_item", "text": "Пункт списка" }, { "type": "callout", "text": "Важная заметка", "emoji": "💡" }, { "type": "quote", "text": "Цитата или ключевая мысль" }, { "type": "divider" } ] } Используй разные типы блоков для красивого оформления. Структурируй информацию логично.`
+        },
+        { role: 'user', content: userText }
+      ]
     }
+  );
+
+  if (!res?.choices) return null;
+  try {
+    const raw = res.choices[0].message.content.trim()
+      .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '');
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('Notion JSON parse error:', e.message);
+    return null;
+  }
 }
 
 function buildNotionBlocks(blocks) {
-    return blocks.map(b => {
-        const richText = (text) => [{ type: 'text', text: { content: text || '' } }];
-
-        switch(b.type) {
-            case 'heading_1':
-                return { object: 'block', type: 'heading_1', heading_1: { rich_text: richText(b.text) } };
-            case 'heading_2':
-                return { object: 'block', type: 'heading_2', heading_2: { rich_text: richText(b.text) } };
-            case 'heading_3':
-                return { object: 'block', type: 'heading_3', heading_3: { rich_text: richText(b.text) } };
-            case 'bulleted_list_item':
-                return { object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: richText(b.text) } };
-            case 'numbered_list_item':
-                return { object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: richText(b.text) } };
-            case 'callout':
-                return { object: 'block', type: 'callout', callout: { rich_text: richText(b.text), icon: { type: 'emoji', emoji: b.emoji || '💡' } } };
-            case 'quote':
-                return { object: 'block', type: 'quote', quote: { rich_text: richText(b.text) } };
-            case 'divider':
-                return { object: 'block', type: 'divider', divider: {} };
-            default: // paragraph
-                return { object: 'block', type: 'paragraph', paragraph: { rich_text: richText(b.text) } };
-        }
-    });
+  return blocks.map(b => {
+    const richText = (text) => [{ type: 'text', text: { content: text || '' } }];
+    switch (b.type) {
+      case 'heading_1':
+        return { object: 'block', type: 'heading_1', heading_1: { rich_text: richText(b.text) } };
+      case 'heading_2':
+        return { object: 'block', type: 'heading_2', heading_2: { rich_text: richText(b.text) } };
+      case 'heading_3':
+        return { object: 'block', type: 'heading_3', heading_3: { rich_text: richText(b.text) } };
+      case 'bulleted_list_item':
+        return { object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: richText(b.text) } };
+      case 'numbered_list_item':
+        return { object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: richText(b.text) } };
+      case 'callout':
+        return { object: 'block', type: 'callout', callout: { rich_text: richText(b.text), icon: { type: 'emoji', emoji: b.emoji || '💡' } } };
+      case 'quote':
+        return { object: 'block', type: 'quote', quote: { rich_text: richText(b.text) } };
+      case 'divider':
+        return { object: 'block', type: 'divider', divider: {} };
+      default:
+        return { object: 'block', type: 'paragraph', paragraph: { rich_text: richText(b.text) } };
+    }
+  });
 }
 
 // ─── Форматирование ID в UUID (с дефисами) ───────────────────────────────
 function formatNotionId(id) {
-    const clean = id.replace(/-/g, '');
-    if (clean.length !== 32) return id;
-    return `${clean.slice(0,8)}-${clean.slice(8,12)}-${clean.slice(12,16)}-${clean.slice(16,20)}-${clean.slice(20)}`;
+  const clean = id.replace(/-/g, '');
+  if (clean.length !== 32) return id;
+  return `${clean.slice(0, 8)}-${clean.slice(8, 12)}-${clean.slice(12, 16)}-${clean.slice(16, 20)}-${clean.slice(20)}`;
 }
 
 // ─── Notion: поиск страниц через Search API ──────────────────────────────
 async function readNotionPages(query = '') {
-    const notionHeaders = {
-        'Authorization': `Bearer ${NOTION_TOKEN}`,
-        'Notion-Version': '2022-06-28'
-    };
+  const notionHeaders = {
+    'Authorization': `Bearer ${NOTION_TOKEN}`,
+    'Notion-Version': '2022-06-28'
+  };
+  const searchBody = { page_size: 30, filter: { value: 'page', property: 'object' } };
+  if (query) searchBody.query = query;
 
-    // Notion Search API — ищет по всем страницам к которым есть доступ
-    const searchBody = { page_size: 30, filter: { value: 'page', property: 'object' } };
-    if (query) searchBody.query = query;
+  const result = await makeRequest(
+    'https://api.notion.com/v1/search',
+    'POST', notionHeaders, searchBody
+  );
 
-    const result = await makeRequest(
-        'https://api.notion.com/v1/search',
-        'POST', notionHeaders, searchBody
-    );
+  if (!result?.results) {
+    console.log('Notion search failed:', JSON.stringify(result));
+    return [];
+  }
 
-    if (!result?.results) {
-        console.log('Notion search failed:', JSON.stringify(result));
-        return [];
-    }
+  const pages = result.results.map(page => {
+    const titleArr = page.properties?.title?.title
+      || page.properties?.Name?.title
+      || page.title
+      || [];
+    const title = titleArr.map(t => t.plain_text).join('') || 'Без названия';
+    return { id: page.id, title, url: page.url };
+  });
 
-    const pages = result.results.map(page => {
-        const titleArr = page.properties?.title?.title
-            || page.properties?.Name?.title
-            || page.title  // для обычных страниц
-            || [];
-        const title = titleArr.map(t => t.plain_text).join('') || 'Без названия';
-        return { id: page.id, title, url: page.url };
-    }).filter(p => p.title !== 'Без названия' || true);
-
-    console.log(`Notion search (query="${query}"): найдено ${pages.length} страниц:`, pages.map(p => p.title));
-    return pages;
+  console.log(`Notion search (query="${query}"): найдено ${pages.length} страниц:`, pages.map(p => p.title));
+  return pages;
 }
 
 // Читаем содержимое страницы — включая вложенные toggle блоки
 async function readNotionPageContent(pageId, depth = 0) {
-    if (depth > 3) return ''; // защита от бесконечной рекурсии
-    const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
-    const result = await makeRequest(
-        `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
-        'GET', notionHeaders
-    );
-    if (!result?.results) return '';
+  if (depth > 3) return '';
+  const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
+  const result = await makeRequest(
+    `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
+    'GET', notionHeaders
+  );
+  if (!result?.results) return '';
 
-    const getText = (arr) => arr?.map(t => t.plain_text).join('') || '';
-    const indent = '  '.repeat(depth);
-    const lines = [];
+  const getText = (arr) => arr?.map(t => t.plain_text).join('') || '';
+  const indent = '  '.repeat(depth);
+  const lines = [];
 
-    for (const block of result.results) {
-        let line = '';
-        switch(block.type) {
-            case 'paragraph':           line = getText(block.paragraph?.rich_text); break;
-            case 'heading_1':           line = '# ' + getText(block.heading_1?.rich_text); break;
-            case 'heading_2':           line = '## ' + getText(block.heading_2?.rich_text); break;
-            case 'heading_3':           line = '### ' + getText(block.heading_3?.rich_text); break;
-            case 'bulleted_list_item':  line = '• ' + getText(block.bulleted_list_item?.rich_text); break;
-            case 'numbered_list_item':  line = '→ ' + getText(block.numbered_list_item?.rich_text); break;
-            case 'callout':             line = '💡 ' + getText(block.callout?.rich_text); break;
-            case 'quote':               line = '❝ ' + getText(block.quote?.rich_text); break;
-            case 'toggle':              line = '▶ ' + getText(block.toggle?.rich_text); break;
-            case 'to_do':               line = (block.to_do?.checked ? '✅' : '☐') + ' ' + getText(block.to_do?.rich_text); break;
-            case 'code':                line = getText(block.code?.rich_text); break;
-            default: line = '';
-        }
-
-        if (line) lines.push(indent + line);
-
-        // Если у блока есть дети (toggle, bulleted с вложением и т.д.) — читаем рекурсивно
-        if (block.has_children) {
-            const children = await readNotionPageContent(block.id, depth + 1);
-            if (children) lines.push(children);
-        }
+  for (const block of result.results) {
+    let line = '';
+    switch (block.type) {
+      case 'paragraph':           line = getText(block.paragraph?.rich_text); break;
+      case 'heading_1':           line = '# ' + getText(block.heading_1?.rich_text); break;
+      case 'heading_2':           line = '## ' + getText(block.heading_2?.rich_text); break;
+      case 'heading_3':           line = '### ' + getText(block.heading_3?.rich_text); break;
+      case 'bulleted_list_item':  line = '• ' + getText(block.bulleted_list_item?.rich_text); break;
+      case 'numbered_list_item':  line = '→ ' + getText(block.numbered_list_item?.rich_text); break;
+      case 'callout':             line = '💡 ' + getText(block.callout?.rich_text); break;
+      case 'quote':               line = '❝ ' + getText(block.quote?.rich_text); break;
+      case 'toggle':              line = '▶ ' + getText(block.toggle?.rich_text); break;
+      case 'to_do':               line = (block.to_do?.checked ? '✅' : '☐') + ' ' + getText(block.to_do?.rich_text); break;
+      case 'code':                line = getText(block.code?.rich_text); break;
+      default: line = '';
     }
+    if (line) lines.push(indent + line);
 
-    return lines.filter(Boolean).join('\n');
+    if (block.has_children) {
+      const children = await readNotionPageContent(block.id, depth + 1);
+      if (children) lines.push(children);
+    }
+  }
+  return lines.filter(Boolean).join('\n');
 }
 
 // ─── Notion: умная логика — читать или писать? ────────────────────────────
-// Защита от двойного запуска
 const notionLocks = new Set();
 
 async function handleNotion(userText) {
-    if (!NOTION_TOKEN || !NOTION_PAGE_ID) {
-        return '❌ Notion не настроен. Добавь NOTION_TOKEN и NOTION_PAGE_ID в переменные Render.';
+  if (!NOTION_TOKEN || !NOTION_PAGE_ID) {
+    return '❌ Notion не настроен. Добавь NOTION_TOKEN и NOTION_PAGE_ID в переменные Render.';
+  }
+
+  const lockKey = userText.trim().toLowerCase();
+  if (notionLocks.has(lockKey)) {
+    console.log('Notion: дубль запроса, игнорирую');
+    return '';
+  }
+  notionLocks.add(lockKey);
+  setTimeout(() => notionLocks.delete(lockKey), 30000);
+
+  try {
+    const pages = await readNotionPages(userText.replace(/[?？!！]/g, '').trim());
+    console.log(`Notion pages found: ${pages.length}`, pages.map(p => p.title));
+
+    const isQuestion = /[?？]/.test(userText) ||
+      /^(что|когда|где|как|кто|сколько|почему|зачем|какой|какая|какие|есть ли|покажи|напомни|расскажи)/i.test(userText.trim());
+
+    console.log(`Notion intent: ${isQuestion ? 'ЧИТАТЬ' : 'ВОЗМОЖНО СОЗДАТЬ'}`);
+
+    if (pages.length === 0 && !isQuestion) {
+      return await createNotionPage(userText);
+    }
+    if (pages.length === 0 && isQuestion) {
+      return '📭 В Notion пока нет страниц по этой теме.';
     }
 
-    // Защита от дублей — если такой же запрос уже обрабатывается
-    const lockKey = userText.trim().toLowerCase();
-    if (notionLocks.has(lockKey)) {
-        console.log('Notion: дубль запроса, игнорирую');
-        return '';
+    const pagesWithContent = await Promise.all(pages.map(async p => {
+      const c = await readNotionPageContent(p.id);
+      return { ...p, content: c };
+    }));
+
+    const fullContext = pagesWithContent
+      .map(p => `=== ${p.title} ===\n${p.content || '(пусто)'}`)
+      .join('\n\n');
+
+    const checkRes = await makeRequest(
+      'https://api.deepseek.com/v1/chat/completions',
+      'POST',
+      { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      {
+        model: 'deepseek-chat',
+        max_tokens: 700,
+        messages: [
+          {
+            role: 'system',
+            content: isQuestion
+              ? `Пользователь задал вопрос про содержимое Notion. Найди ответ в тексте страниц и ответь кратко и понятно. Укажи из какой страницы взял информацию. Если ответа нет — скажи что не нашёл. Отвечай на русском.`
+              : `Пользователь хочет что-то записать в Notion. Посмотри есть ли уже страница на эту тему. Если есть — ответь: НАЙДЕНО В: [название страницы] — и кратко что там есть. Если нет — ответь одним словом: СОЗДАТЬ`
+          },
+          { role: 'user', content: `Запрос: "${userText}"\n\nСодержимое Notion:\n${fullContext}` }
+        ]
+      }
+    );
+
+    const answer = checkRes?.choices?.[0]?.message?.content?.trim() || '';
+    console.log('Notion answer:', answer.substring(0, 80));
+
+    if (isQuestion) {
+      const pageRef = pagesWithContent.find(p =>
+        answer.toLowerCase().includes(p.title.toLowerCase().slice(0, 6))
+      );
+      const link = pageRef ? `\n\n🔗 ${pageRef.url}` : '';
+      return `📖 <b>Notion:</b>\n\n${answer}${link}`;
     }
-    notionLocks.add(lockKey);
-    setTimeout(() => notionLocks.delete(lockKey), 30000);
 
-    try {
-        // 1. Ищем страницы в Notion (с запросом для лучшего результата)
-        const pages = await readNotionPages(userText.replace(/[?！]/g, '').trim());
-        console.log(`Notion pages found: ${pages.length}`, pages.map(p => p.title));
-
-        // 2. Определяем намерение — вопрос или запись?
-        const isQuestion = /[?？]/.test(userText) || 
-            /^(что|когда|где|как|кто|сколько|почему|зачем|какой|какая|какие|есть ли|покажи|напомни|расскажи)/i.test(userText.trim());
-
-        console.log(`Notion intent: ${isQuestion ? 'ЧИТАТЬ' : 'ВОЗМОЖНО СОЗДАТЬ'}`);
-
-        if (pages.length === 0 && !isQuestion) {
-            return await createNotionPage(userText);
-        }
-
-        if (pages.length === 0 && isQuestion) {
-            return '📭 В Notion пока нет страниц по этой теме.';
-        }
-
-        // 3. Читаем содержимое ВСЕХ страниц для поиска
-        const pagesWithContent = await Promise.all(pages.map(async p => {
-            const c = await readNotionPageContent(p.id);
-            return { ...p, content: c };
-        }));
-
-        const fullContext = pagesWithContent
-            .map(p => `=== ${p.title} ===\n${p.content || '(пусто)'}`)
-            .join('\n\n');
-
-        // 4. DeepSeek ищет ответ в содержимом и решает
-        const checkRes = await makeRequest(
-            'https://api.deepseek.com/v1/chat/completions',
-            'POST',
-            { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-            {
-                model: 'deepseek-chat',
-                max_tokens: 700,
-                messages: [
-                    {
-                        role: 'system',
-                        content: isQuestion
-                            ? `Пользователь задал вопрос про содержимое Notion. Найди ответ в тексте страниц и ответь кратко и понятно. Укажи из какой страницы взял информацию. Если ответа нет — скажи что не нашёл. Отвечай на русском.`
-                            : `Пользователь хочет что-то записать в Notion. Посмотри есть ли уже страница на эту тему.
-Если есть — ответь: НАЙДЕНО В: [название страницы] — и кратко что там есть.
-Если нет — ответь одним словом: СОЗДАТЬ`
-                    },
-                    { role: 'user', content: `Запрос: "${userText}"\n\nСодержимое Notion:\n${fullContext}` }
-                ]
-            }
-        );
-
-        const answer = checkRes?.choices?.[0]?.message?.content?.trim() || '';
-        console.log('Notion answer:', answer.substring(0, 80));
-
-        // 5. Если вопрос — просто возвращаем ответ
-        if (isQuestion) {
-            const pageRef = pagesWithContent.find(p =>
-                answer.toLowerCase().includes(p.title.toLowerCase().slice(0, 6))
-            );
-            const link = pageRef ? `\n\n🔗 ${pageRef.url}` : '';
-            return `📖 <b>Notion:</b>\n\n${answer}${link}`;
-        }
-
-        // 6. Если запись и уже есть — сообщаем
-        if (answer.startsWith('НАЙДЕНО В:')) {
-            return `📌 ${answer}\n\nЕсли хочешь всё равно создать новую — напиши точнее что именно записать.`;
-        }
-
-        // 7. Создаём новую страницу
-        return await createNotionPage(userText);
-
-    } finally {
-        notionLocks.delete(lockKey);
+    if (answer.startsWith('НАЙДЕНО В:')) {
+      return `📌 ${answer}\n\nЕсли хочешь всё равно создать новую — напиши точнее что именно записать.`;
     }
+
+    return await createNotionPage(userText);
+
+  } finally {
+    notionLocks.delete(lockKey);
+  }
 }
 
 async function createNotionPage(userText) {
-    const formatted = await formatForNotion(userText);
-    if (!formatted) return '❌ Не удалось оформить заметку.';
+  const formatted = await formatForNotion(userText);
+  if (!formatted) return '❌ Не удалось оформить заметку.';
 
-    const pageId = formatNotionId(NOTION_PAGE_ID);
-    const result = await makeRequest(
-        'https://api.notion.com/v1/pages',
-        'POST',
-        { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' },
-        {
-            parent: { page_id: pageId },
-            icon: { type: 'emoji', emoji: formatted.emoji || '📝' },
-            properties: {
-                title: { title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }] }
-            },
-            children: buildNotionBlocks(formatted.blocks || [])
-        }
-    );
+  const pageId = formatNotionId(NOTION_PAGE_ID);
+  const result = await makeRequest(
+    'https://api.notion.com/v1/pages',
+    'POST',
+    { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' },
+    {
+      parent: { page_id: pageId },
+      icon: { type: 'emoji', emoji: formatted.emoji || '📝' },
+      properties: {
+        title: { title: [{ type: 'text', text: { content: formatted.title || 'Заметка' } }] }
+      },
+      children: buildNotionBlocks(formatted.blocks || [])
+    }
+  );
 
-    if (result?.id) {
-        return `✅ Сохранено в Notion!\n📄 <b>${formatted.title}</b>\n🔗 ${result.url}`;
-    }
-    const errMsg = result?.message || result?.code || JSON.stringify(result);
-    console.error('Notion create error:', errMsg);
-    if (errMsg?.includes('object_not_found') || errMsg?.includes('restricted')) {
-        return `❌ Нет доступа.\nОткрой страницу в Notion → ... → Connections → добавь интеграцию.`;
-    }
-    if (errMsg?.includes('Unauthorized') || errMsg?.includes('token')) {
-        return `❌ Неверный токен. NOTION_TOKEN должен начинаться с secret_`;
-    }
-    return `❌ Ошибка Notion: ${errMsg}`;
+  if (result?.id) {
+    return `✅ Сохранено в Notion!\n📄 <b>${formatted.title}</b>\n🔗 ${result.url}`;
+  }
+  const errMsg = result?.message || result?.code || JSON.stringify(result);
+  console.error('Notion create error:', errMsg);
+  if (errMsg?.includes('object_not_found') || errMsg?.includes('restricted')) {
+    return `❌ Нет доступа.\nОткрой страницу в Notion → ... → Connections → добавь интеграцию.`;
+  }
+  if (errMsg?.includes('Unauthorized') || errMsg?.includes('token')) {
+    return `❌ Неверный токен. NOTION_TOKEN должен начинаться с secret_`;
+  }
+  return `❌ Ошибка Notion: ${errMsg}`;
 }
 
 // ─── История из SheetDB ───────────────────────────────────────────────────
 async function loadHistoryFromSheet() {
-    if (historyLoaded) return;
-    console.log('Загружаю историю из SheetDB...');
-    const data = await makeRequest(SHEETDB_URL, 'GET');
-    if (Array.isArray(data)) {
-        let facts = [];
-        data.forEach(row => {
-            if (row.chatId && row.role && row.content) {
-                if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
-                chatHistories[row.chatId].push({ role: row.role, content: row.content });
-            }
-            if (row.important_fact) facts.push(row.important_fact);
-        });
-        globalImportantFacts = facts.join(' | ');
-        historyLoaded = true;
-        console.log(`✅ История загружена. Чатов: ${Object.keys(chatHistories).length}`);
-    }
+  if (historyLoaded) return;
+  console.log('Загружаю историю из SheetDB...');
+  const data = await makeRequest(SHEETDB_URL, 'GET');
+  if (Array.isArray(data)) {
+    let facts = [];
+    data.forEach(row => {
+      if (row.chatId && row.role && row.content) {
+        if (!chatHistories[row.chatId]) chatHistories[row.chatId] = [];
+        chatHistories[row.chatId].push({ role: row.role, content: row.content });
+      }
+      if (row.important_fact) facts.push(row.important_fact);
+    });
+    globalImportantFacts = facts.join(' | ');
+    historyLoaded = true;
+    console.log(`✅ История загружена. Чатов: ${Object.keys(chatHistories).length}`);
+  }
 }
 
 async function extractImportantFact(userText, aiAnswer) {
-    const res = await makeRequest(
-        'https://api.deepseek.com/v1/chat/completions',
-        'POST',
-        { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+  const res = await makeRequest(
+    'https://api.deepseek.com/v1/chat/completions',
+    'POST',
+    { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+    {
+      model: 'deepseek-chat',
+      max_tokens: 80,
+      messages: [
         {
-            model: 'deepseek-chat',
-            max_tokens: 80,
-            messages: [
-                {
-                    role: 'system',
-                    content: `Анализируй диалог. Есть ли важная информация о пользователе для постоянного запоминания?
-Важное: имя, возраст, город, работа, семья, интересы, цели, планы, важные даты, предпочтения.
-Если есть — напиши ТОЛЬКО краткий факт до 80 символов. Например: "Зовут Максим, 30 лет, живёт в Риме"
-Если важного нет — ответь одним словом: НЕТ`
-                },
-                { role: 'user', content: `Пользователь: ${userText}\nБот: ${aiAnswer.substring(0, 300)}` }
-            ]
-        }
-    );
-    if (res?.choices) {
-        const fact = res.choices[0].message.content.trim();
-        if (fact && fact.toUpperCase() !== 'НЕТ' && !fact.toUpperCase().startsWith('НЕТ')) {
-            console.log(`💾 Важный факт: ${fact}`);
-            return fact;
-        }
+          role: 'system',
+          content: `Анализируй диалог. Есть ли важная информация о пользователе для постоянного запоминания? Важное: имя, возраст, город, работа, семья, интересы, цели, планы, важные даты, предпочтения. Если есть — напиши ТОЛЬКО краткий факт до 80 символов. Например: "Зовут Максим, 30 лет, живёт в Риме" Если важного нет — ответь одним словом: НЕТ`
+        },
+        { role: 'user', content: `Пользователь: ${userText}\nБот: ${aiAnswer.substring(0, 300)}` }
+      ]
     }
-    return '';
+  );
+  if (res?.choices) {
+    const fact = res.choices[0].message.content.trim();
+    if (fact && fact.toUpperCase() !== 'НЕТ' && !fact.toUpperCase().startsWith('НЕТ')) {
+      console.log(`💾 Важный факт: ${fact}`);
+      return fact;
+    }
+  }
+  return '';
 }
 
 async function saveToSheet(chatId, userText, aiAnswer) {
-    const importantInfo = await extractImportantFact(userText, aiAnswer);
-    await makeRequest(SHEETDB_URL, 'POST', {}, {
-        data: [
-            { chatId, role: 'user', content: userText },
-            { chatId, role: 'assistant', content: aiAnswer, important_fact: importantInfo }
-        ]
-    });
+  const importantInfo = await extractImportantFact(userText, aiAnswer);
+  await makeRequest(SHEETDB_URL, 'POST', {}, {
+    data: [
+      { chatId, role: 'user', content: userText },
+      { chatId, role: 'assistant', content: aiAnswer, important_fact: importantInfo }
+    ]
+  });
 }
 
-// ─── Отправка сообщения частями ───────────────────────────────────────────
+// ─── Отправка / редактирование сообщений ──────────────────────────────────
 async function sendMessage(chatId, text) {
-    for (let i = 0; i < text.length; i += 4000) {
-        await makeRequest(
-            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-            'POST', {},
-            { chat_id: chatId, text: text.slice(i, i + 4000), parse_mode: 'HTML' }
-        );
-    }
+  let lastId = null;
+  for (let i = 0; i < text.length; i += 4000) {
+    const r = await makeRequest(
+      `${TG_API}/sendMessage`,
+      'POST', {},
+      { chat_id: chatId, text: text.slice(i, i + 4000), parse_mode: 'HTML' }
+    );
+    lastId = r?.result?.message_id || lastId;
+  }
+  return lastId;
+}
+
+async function editMessage(chatId, messageId, text) {
+  return makeRequest(
+    `${TG_API}/editMessageText`,
+    'POST', {},
+    { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML' }
+  );
+}
+
+// Финальная сборка: правим плейсхолдер первым куском, остальное — новыми сообщениями
+async function finalizeMessage(chatId, messageId, fullText) {
+  const chunks = [];
+  for (let i = 0; i < fullText.length; i += 4000) chunks.push(fullText.slice(i, i + 4000));
+  if (chunks.length === 0) chunks.push('…');
+  if (messageId) await editMessage(chatId, messageId, chunks[0]);
+  else await sendMessage(chatId, chunks[0]);
+  for (let i = 1; i < chunks.length; i++) {
+    await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, { chat_id: chatId, text: chunks[i], parse_mode: 'HTML' });
+  }
+}
+
+// Потоковый ответ с живым редактированием сообщения
+async function streamAnswer(chatId, messages) {
+  const init = await makeRequest(
+    `${TG_API}/sendMessage`,
+    'POST', {},
+    { chat_id: chatId, text: '🧠 <i>Думаю…</i>', parse_mode: 'HTML' }
+  );
+  const messageId = init?.result?.message_id || null;
+
+  let lastEditAt = 0;
+  let lastShown = '';
+
+  const tryEdit = async (reasoning, answer) => {
+    if (!messageId) return;
+    const now = Date.now();
+    if (now - lastEditAt < 1500) return; // троттлинг, чтобы не упереться в лимиты Telegram
+    let text = formatStreamingPreview(reasoning, answer);
+    if (text.length > 4000) text = text.slice(0, 4000) + '…';
+    if (text === lastShown) return;
+    lastEditAt = now;
+    lastShown = text;
+    await editMessage(chatId, messageId, text).catch(() => {});
+  };
+
+  const { reasoning, answer } = await streamDeepSeek(
+    { model: 'deepseek-reasoner', messages },
+    (r, a) => { tryEdit(r, a); }
+  );
+
+  return { messageId, reasoning, answer };
 }
 
 // ─── Обработка сообщения ──────────────────────────────────────────────────
 async function handleUpdate(upd) {
-    if (!upd.message || !upd.message.text) return;
+  if (!upd.message || !upd.message.text) return;
 
-    const userId = upd.message.from.id.toString();
-    const chatId = upd.message.chat.id.toString();
-    const txt = upd.message.text;
+  const userId = upd.message.from.id.toString();
+  const chatId = upd.message.chat.id.toString();
+  const messageId = upd.message.message_id;
+  const txt = upd.message.text;
 
-    // 🔒 Проверка доступа — только твой аккаунт
-    if (userId !== ALLOWED_USER_ID) {
-        console.log(`⛔ Отклонён пользователь: ${userId}`);
-        await makeRequest(
-            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-            'POST', {},
-            { chat_id: chatId, text: '⛔ У тебя нет доступа к этому боту.' }
-        );
-        return;
-    }
-
-    console.log(`[${chatId}] ${txt.substring(0, 60)}`);
-
-    // Показываем "печатает..."
+  // 🔒 Проверка доступа — только твой аккаунт
+  if (userId !== ALLOWED_USER_ID) {
+    console.log(`⛔ Отклонён пользователь: ${userId}`);
     await makeRequest(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendChatAction`,
-        'POST', {}, { chat_id: chatId, action: 'typing' }
+      `${TG_API}/sendMessage`,
+      'POST', {},
+      { chat_id: chatId, text: '⛔ У тебя нет доступа к этому боту.' }
     );
+    return;
+  }
 
-    // 📝 Команда /notion — умная работа с Notion
-    if (txt.startsWith('/notion ') || txt.startsWith('/notion\n') || txt === '/notion') {
-        const noteText = txt.replace(/^\/notion[\s\n]?/, '').trim();
-        if (!noteText) {
-            await sendMessage(chatId, '✏️ Напиши тему или текст: <code>/notion твой текст или идея</code>\n\nЯ сам пойму — показать что есть в Notion или записать новое.');
-            return;
-        }
-        await sendMessage(chatId, '🔍 Ищу в Notion...');
-        const result = await handleNotion(noteText);
-        await sendMessage(chatId, result);
-        return;
+  console.log(`[${chatId}] ${txt.substring(0, 60)}`);
+
+  // ⚡️ Реакция вместо ответа — экономим токены (без вызова ИИ)
+  if (!txt.startsWith('/')) {
+    const emoji = decideReaction(txt);
+    if (emoji) {
+      console.log(`👍 Реагирую "${emoji}" вместо ответа`);
+      await setReaction(chatId, messageId, emoji);
+      // в историю кладём только реплику пользователя, ИИ-факты не дёргаем
+      if (!chatHistories[chatId]) chatHistories[chatId] = [];
+      chatHistories[chatId].push({ role: 'user', content: txt });
+      return;
     }
+  }
 
-    // 📖 Команда /help
-    if (txt === '/help' || txt === '/start') {
-        await sendMessage(chatId,
-            `👋 <b>Привет! Вот что я умею:</b>\n\n` +
-            `💬 Просто пиши — я отвечу и запомню важное\n` +
-            `🔍 Попроси найти что-то — поищу в интернете\n` +
-            `📝 <code>/notion текст</code> — ищу в Notion или записываю новое\n` +
-            `🧠 Помню последние 10 сообщений + важные факты всегда`
-        );
-        return;
+  // Показываем "печатает..."
+  await makeRequest(
+    `${TG_API}/sendChatAction`,
+    'POST', {}, { chat_id: chatId, action: 'typing' }
+  );
+
+  // 📝 Команда /notion
+  if (txt.startsWith('/notion ') || txt.startsWith('/notion\n') || txt === '/notion') {
+    const noteText = txt.replace(/^\/notion[\s\n]?/, '').trim();
+    if (!noteText) {
+      await sendMessage(chatId, '✏️ Напиши тему или текст: <code>/notion твой текст или идея</code>\n\nЯ сам пойму — показать что есть в Notion или записать новое.');
+      return;
     }
+    await sendMessage(chatId, '🔍 Ищу в Notion...');
+    const result = await handleNotion(noteText);
+    await sendMessage(chatId, result);
+    return;
+  }
 
-    // Поиск если нужен
-    let searchContext = '';
-    if (needsSearch(txt)) {
-        console.log('Ищу в интернете:', txt);
-        const searchResult = await searchWeb(txt);
-        if (searchResult) {
-            searchContext = `\n\nРезультаты поиска:\n${searchResult}`;
-        }
-    }
-
-    // Запрос к DeepSeek
-    const res = await makeRequest(
-        'https://api.deepseek.com/v1/chat/completions',
-        'POST',
-        { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-        {
-            model: 'deepseek-reasoner',
-            messages: [
-                {
-                    role: 'system',
-                    content: `Ты — умный личный помощник в Telegram. Отвечай на русском языке.
-Сейчас: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau', dateStyle: 'full', timeStyle: 'short' })}
-Важные факты о пользователе (помни всегда): ${globalImportantFacts}
-${searchContext ? 'Используй результаты поиска для ответа.' : ''}`
-                },
-                ...(chatHistories[chatId] || []).slice(-10),
-                { role: 'user', content: txt + searchContext }
-            ]
-        }
+  // 📖 Команда /help
+  if (txt === '/help' || txt === '/start') {
+    await sendMessage(chatId,
+      `👋 <b>Привет! Вот что я умею:</b>\n\n` +
+      `💬 Просто пиши — я отвечу и запомню важное\n` +
+      `⚡️ На короткие фразы («я дома», «спасибо») просто ставлю реакцию, не трачу токены\n` +
+      `🔍 Попроси найти что-то — поищу в интернете\n` +
+      `📝 <code>/notion текст</code> — ищу в Notion или записываю новое\n` +
+      `🧠 Помню последние 10 сообщений + важные факты всегда`
     );
+    return;
+  }
 
-    if (res?.choices) {
-        const msg = res.choices[0].message;
-        const thinkingText = msg.reasoning_content || '';
-        const answerText = msg.content || '';
-
-        console.log(`Мысли: ${thinkingText.substring(0, 50)}...`);
-        console.log(`Ответ: ${answerText.substring(0, 50)}...`);
-
-        const formattedAnswer = formatAiResponse(thinkingText, answerText);
-
-        if (!chatHistories[chatId]) chatHistories[chatId] = [];
-        chatHistories[chatId].push({ role: 'user', content: txt });
-        chatHistories[chatId].push({ role: 'assistant', content: answerText });
-
-        await sendMessage(chatId, formattedAnswer);
-        saveToSheet(chatId, txt, answerText).catch(console.error);
-    } else {
-        console.error('DeepSeek ошибка:', JSON.stringify(res));
-        await sendMessage(chatId, '⚠️ Ошибка AI. Попробуй ещё раз.');
+  // Поиск если нужен
+  let searchContext = '';
+  if (needsSearch(txt)) {
+    console.log('Ищу в интернете:', txt);
+    const searchResult = await searchWeb(txt);
+    if (searchResult) {
+      searchContext = `\n\nРезультаты поиска:\n${searchResult}`;
     }
+  }
+
+  const messages = [
+    {
+      role: 'system',
+      content: `Ты — умный личный помощник в Telegram. Отвечай на русском языке. Сейчас: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau', dateStyle: 'full', timeStyle: 'short' })} Важные факты о пользователе (помни всегда): ${globalImportantFacts} ${searchContext ? 'Используй результаты поиска для ответа.' : ''}`
+    },
+    ...(chatHistories[chatId] || []).slice(-10),
+    { role: 'user', content: txt + searchContext }
+  ];
+
+  // 🔁 Потоковый ответ (stream responses)
+  const { messageId: streamMsgId, reasoning, answer } = await streamAnswer(chatId, messages);
+
+  if (answer || reasoning) {
+    console.log(`Мысли: ${reasoning.substring(0, 50)}...`);
+    console.log(`Ответ: ${answer.substring(0, 50)}...`);
+
+    const formattedAnswer = formatAiResponse(reasoning, answer);
+
+    if (!chatHistories[chatId]) chatHistories[chatId] = [];
+    chatHistories[chatId].push({ role: 'user', content: txt });
+    chatHistories[chatId].push({ role: 'assistant', content: answer });
+
+    await finalizeMessage(chatId, streamMsgId, formattedAnswer);
+    saveToSheet(chatId, txt, answer).catch(console.error);
+  } else {
+    console.error('DeepSeek ошибка: пустой стрим');
+    if (streamMsgId) await editMessage(chatId, streamMsgId, '⚠️ Ошибка AI. Попробуй ещё раз.');
+    else await sendMessage(chatId, '⚠️ Ошибка AI. Попробуй ещё раз.');
+  }
 }
 
 // ─── Webhook ──────────────────────────────────────────────────────────────
 async function setupWebhook() {
-    const result = await makeRequest(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`,
-        'POST', {},
-        { url: `${RENDER_URL}/webhook/${TELEGRAM_BOT_TOKEN}` }
-    );
-    console.log('Webhook:', result?.description || JSON.stringify(result));
+  const result = await makeRequest(
+    `${TG_API}/setWebhook`,
+    'POST', {},
+    {
+      url: `${RENDER_URL}/webhook/${TELEGRAM_BOT_TOKEN}`,
+      // нужно, чтобы Telegram присылал апдейты (на всякий случай оставляем дефолт)
+      allowed_updates: ['message']
+    }
+  );
+  console.log('Webhook:', result?.description || JSON.stringify(result));
 }
 
 const server = http.createServer(async (req, res) => {
-    if (req.method === 'GET' && req.url === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Бот активен!');
-        return;
-    }
-    if (req.method === 'POST' && req.url === `/webhook/${TELEGRAM_BOT_TOKEN}`) {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', async () => {
-            res.writeHead(200);
-            res.end('OK');
-            try { await handleUpdate(JSON.parse(body)); }
-            catch(e) { console.error('Webhook parse error:', e.message); }
-        });
-        return;
-    }
-    res.writeHead(404);
-    res.end('Not found');
+  if (req.method === 'GET' && req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Бот активен!');
+    return;
+  }
+  if (req.method === 'POST' && req.url === `/webhook/${TELEGRAM_BOT_TOKEN}`) {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      res.writeHead(200);
+      res.end('OK');
+      try { await handleUpdate(JSON.parse(body)); }
+      catch (e) { console.error('Webhook parse error:', e.message); }
+    });
+    return;
+  }
+  res.writeHead(404);
+  res.end('Not found');
 });
 
 server.listen(PORT, async () => {
-    console.log(`🚀 Сервер на порту ${PORT}`);
-    await loadHistoryFromSheet();
-    await setupWebhook();
-    console.log('✅ Бот готов!');
-    startSelfPing();
+  console.log(`🚀 Сервер на порту ${PORT}`);
+  await loadHistoryFromSheet();
+  await setupWebhook();
+  console.log('✅ Бот готов!');
+  startSelfPing();
 });
 
 function startSelfPing() {
-    setInterval(() => {
-        makeRequest(`${RENDER_URL}/`, 'GET')
-            .then(() => console.log('✅ Self-ping OK'))
-            .catch(() => console.log('⚠️ Self-ping failed'));
-    }, 8 * 60 * 1000);
+  setInterval(() => {
+    makeRequest(`${RENDER_URL}/`, 'GET')
+      .then(() => console.log('✅ Self-ping OK'))
+      .catch(() => console.log('⚠️ Self-ping failed'));
+  }, 8 * 60 * 1000);
 }
