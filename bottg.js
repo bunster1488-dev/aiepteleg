@@ -183,7 +183,7 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
   });
 }
 
-// ─── DeepSeek stream ────────────────────────────────────────────────────
+// ─── DeepSeek stream с общим таймаутом ─────────────────────────────────
 function streamDeepSeek(body, onDelta) {
   return new Promise((resolve) => {
     const url = new URL('https://api.deepseek.com/v1/chat/completions');
@@ -192,7 +192,7 @@ function streamDeepSeek(body, onDelta) {
       path: url.pathname,
       method: 'POST',
       agent: keepAliveAgent,
-      timeout: 30000,
+      timeout: 25000,   // общий таймаут 25 секунд
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
@@ -708,7 +708,6 @@ async function handleFileUpload(chatId, message) {
 
 // ─── Основной обработчик обновлений ────────────────────────────────────
 async function handleUpdate(upd) {
-  // callback_query сначала
   if (upd.callback_query) {
     const q = upd.callback_query;
     const chatId = q.message.chat.id.toString();
@@ -786,14 +785,14 @@ async function handleUpdate(upd) {
     return;
   }
 
-  // ================= КОМАНДЫ (первыми /help) =================
+  // ================= КОМАНДЫ (строго с return) =================
   if (text === '/help' || text === '/start') {
     const panelUrl = `${RENDER_URL}/panel?token=bunst-8524-588`;
-    const helpText = `👋 <b>Я — твой умный помощник!</b>\n\n` +
-      `💬 <b>Общение:</b> просто пиши, я отвечаю и запоминаю важное.\n` +
-      `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
-      `🔍 <b>Поиск:</b> спроси «найди что-то» – поищу в интернете.\n` +
-      `📋 <b>Команды:</b>\n` +
+    const helpText = `👋 Я — твой умный помощник!\n\n` +
+      `💬 Общение: просто пиши, я отвечу и запомню важное.\n` +
+      `⚡️ Реакции: на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
+      `🔍 Поиск: спроси «найди что-то» – поищу в интернете.\n` +
+      `📋 Команды:\n` +
       `/notion [текст] – поиск или создание заметки в Notion.\n` +
       `/todo [текст] – добавить задачу в Notion (без ИИ).\n` +
       `/note [текст] – добавить заметку в Notion (без ИИ).\n` +
@@ -802,10 +801,10 @@ async function handleUpdate(upd) {
       `/facts add [текст] – сохранить факт.\n` +
       `/facts find [запрос] – найти факты.\n` +
       `/clear – очистить историю диалога.\n` +
-      `🔗 <b>Ссылки:</b> отправь URL — я сделаю краткую сводку.\n` +
-      `📎 <b>Файлы:</b> отправь фото или документ — загружу в Notion.\n` +
-      `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о задачах из Notion.\n` +
-      `🌐 <b>Веб-панель:</b> ${panelUrl}`;
+      `🔗 Ссылки: отправь URL — я сделаю краткую сводку.\n` +
+      `📎 Файлы: отправь фото или документ — загружу в Notion.\n` +
+      `⏰ Автономные задачи: утром (09:00) план дня, вечером (19:00) напоминание о задачах из Notion.\n` +
+      `🌐 Веб-панель: ${panelUrl}`;
 
     try {
       const msgId = await sendMessage(chatId, helpText);
@@ -814,7 +813,7 @@ async function handleUpdate(upd) {
       log('ERROR', 'Ошибка отправки /help:', e.message);
       await sendMessage(chatId, '⚠️ Не удалось отправить справку.');
     }
-    return;
+    return;  // ⬅️ ВАЖНО
   }
 
   if (text.startsWith('/remind ')) {
@@ -868,7 +867,7 @@ async function handleUpdate(upd) {
     return;
   }
 
-  // Если команда не распознана – основной диалог
+  // Основной диалог (только если не команда)
   await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
 
   let searchContext = '';
