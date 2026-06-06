@@ -34,8 +34,7 @@ const log = (level, ...args) => {
   }
 };
 
-// ─── HTTP‑агент с таймаутами ───────────────────────────────────────────
-const keepAliveAgent = new https.Agent({ keepAlive: true, timeout: 15000 });
+// ─── Глобальные константы ──────────────────────────────────────────────
 const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 // ─── Глобальные in‑memory кеши ─────────────────────────────────────────
@@ -159,7 +158,7 @@ function formatStreamingPreview(thinking, answer) {
   return out || '🧠 <i>Думаю…</i>';
 }
 
-// ─── HTTP‑запросы ──────────────────────────────────────────────────────
+// ─── HTTP‑запросы (без кастомного агента) ─────────────────────────────
 function makeRequest(url, method = 'POST', headers = {}, body = null) {
   return new Promise((resolve) => {
     let parsedUrl;
@@ -168,17 +167,18 @@ function makeRequest(url, method = 'POST', headers = {}, body = null) {
       hostname: parsedUrl.hostname,
       path: parsedUrl.pathname + parsedUrl.search,
       method,
-      agent: keepAliveAgent,
       timeout: 12000,
       headers: { 'Content-Type': 'application/json', ...headers }
     };
     const req = https.request(options, (res) => {
       let buf = '';
       res.on('data', d => buf += d);
-      res.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); } });
+      res.on('end', () => {
+        try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); }
+      });
     });
     req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', (e) => { log('ERROR', e.message); resolve(null); });
+    req.on('error', (e) => { log('ERROR', 'Запрос не удался:', e.message); resolve(null); });
     if (body) req.write(JSON.stringify(body));
     req.end();
   });
@@ -192,7 +192,6 @@ function streamDeepSeek(body, onDelta) {
       hostname: url.hostname,
       path: url.pathname,
       method: 'POST',
-      agent: keepAliveAgent,
       timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
@@ -224,7 +223,7 @@ function streamDeepSeek(body, onDelta) {
       res.on('end', () => resolve({ reasoning, answer }));
     });
     req.on('timeout', () => { req.destroy(); resolve({ reasoning: '', answer: '' }); });
-    req.on('error', (e) => { log('ERROR', e.message); resolve({ reasoning: '', answer: '' }); });
+    req.on('error', (e) => { log('ERROR', 'DeepSeek stream error:', e.message); resolve({ reasoning: '', answer: '' }); });
     req.write(JSON.stringify({ ...body, stream: true }));
     req.end();
   });
@@ -633,32 +632,47 @@ async function handleFactsCommand(chatId, text) {
     if (!found.length) return { text: '🔍 Ничего не найдено.', buttons: null };
     return { text: `🔍 <b>Результаты поиска:</b>\n` + found.map(f => `• ${escapeHtml(f.text)}`).join('\n'), buttons: null };
   }
-  return { text: 'Неизвестная команда. Используйте /facts, /facts add, /facts find, /facts delete <номер>', buttons: null };
+  return { text: 'Неизвестная команда. Используйте /facts, /facts add, /facts find, /facts delete номер', buttons: null };
 }
 
-// ─── Отправка сообщений с кнопками ──────────────────────────────────────
+// ─── Отправка сообщений (с подробными логами) ──────────────────────────
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
-    const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
+    const body = {
       chat_id: chatId,
       text: text.slice(i, i+4000),
-      parse_mode: 'HTML',
-      reply_markup: replyMarkup
-    });
-    lastId = r?.result?.message_id || lastId;
+      parse_mode: 'HTML'
+    };
+    if (replyMarkup) {
+      body.reply_markup = replyMarkup;
+    }
+    log('DEBUG', 'Отправка запроса sendMessage...');
+    try {
+      const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, body);
+      log('DEBUG', 'Ответ от Telegram:', JSON.stringify(r).slice(0, 200));
+      if (r && r.ok) {
+        lastId = r.result?.message_id || lastId;
+        log('INFO', 'Сообщение отправлено, message_id:', lastId);
+      } else {
+        log('WARN', 'Ошибка при отправке:', r);
+      }
+    } catch (e) {
+      log('ERROR', 'Исключение в sendMessage:', e.message);
+    }
   }
   return lastId;
 }
 
 async function editMessage(chatId, messageId, text, replyMarkup = null) {
-  return makeRequest(`${TG_API}/editMessageText`, 'POST', {}, {
+  const body = {
     chat_id: chatId,
     message_id: messageId,
     text,
-    parse_mode: 'HTML',
-    reply_markup: replyMarkup
-  });
+    parse_mode: 'HTML'
+  };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  return makeRequest(`${TG_API}/editMessageText`, 'POST', {}, body);
 }
 
 // ─── Обработка файлов ──────────────────────────────────────────────────
@@ -704,6 +718,7 @@ async function handleFileUpload(chatId, message) {
 
 // ─── Основной обработчик обновлений ────────────────────────────────────
 async function handleUpdate(upd) {
+  log('DEBUG', 'handleUpdate вызван');
   if (upd.callback_query) {
     const q = upd.callback_query;
     const chatId = q.message.chat.id.toString();
@@ -729,6 +744,8 @@ async function handleUpdate(upd) {
   const messageId = upd.message.message_id;
   const text = upd.message.text || '';
 
+  log('DEBUG', `Сообщение от ${userId}: "${text}"`);
+
   if (userId !== ALLOWED_USER_ID) {
     await sendMessage(chatId, '⛔ Доступ запрещён.');
     return;
@@ -753,8 +770,6 @@ async function handleUpdate(upd) {
     }
     return;
   }
-
-  log('INFO', `[${chatId}] ${text.substring(0, 60)}`);
 
   // Реакция
   if (!text.startsWith('/')) {
@@ -840,11 +855,12 @@ async function handleUpdate(upd) {
       `/facts – показать/управлять фактами памяти (кнопки).\n` +
       `/facts add [текст] – сохранить факт.\n` +
       `/facts find [запрос] – найти факты.\n` +
-      `/facts delete <номер> – удалить факт (через кнопки).\n` +
+      `/facts delete номер – удалить факт (через кнопки).\n` +
       `/clear – очистить историю диалога.\n` +
       `🔗 <b>Ссылки:</b> отправь URL — я сделаю краткую сводку.\n` +
       `📎 <b>Файлы:</b> отправь фото или документ — загружу в Notion.\n` +
       `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о незакрытых задачах из Notion.`;
+    log('DEBUG', 'Попытка отправить /help');
     await sendMessage(chatId, helpText);
     return;
   }
@@ -982,10 +998,11 @@ function startScheduledTasks() {
 
 // ─── Настройка вебхука ────────────────────────────────────────────────
 async function setupWebhook() {
-  await makeRequest(`${TG_API}/setWebhook`, 'POST', {}, {
+  const res = await makeRequest(`${TG_API}/setWebhook`, 'POST', {}, {
     url: `${RENDER_URL}/webhook/${TELEGRAM_BOT_TOKEN}`,
     allowed_updates: ['message', 'callback_query']
   });
+  log('INFO', 'Webhook setup:', res?.description || res);
 }
 
 // ─── Сервер ───────────────────────────────────────────────────────────
@@ -1001,7 +1018,9 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
       res.writeHead(200);
       res.end('OK');
-      try { await handleUpdate(JSON.parse(body)); } catch (e) { log('ERROR', e.message); }
+      try {
+        await handleUpdate(JSON.parse(body));
+      } catch (e) { log('ERROR', 'Ошибка обработки webhook:', e.message); }
     });
     return;
   }
