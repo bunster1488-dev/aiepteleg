@@ -1,7 +1,6 @@
 const https = require('https');
 const ddg = require('duck-duck-scrape');
 const http = require('http');
-const cron = require('node-cron');
 
 const SHEETDB_URL = process.env.SHEETDB_URL;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -275,7 +274,9 @@ async function formatForNotion(userText) {
 	if (!res?.choices) return null;
 	try {
 		const raw = res.choices[0].message.content.trim()
-			.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '');
+			.replace(/^```json\s*/i, '')
+			.replace(/^```\s*/i, '')
+			.replace(/```$/i, '');
 		return JSON.parse(raw);
 	} catch (e) {
 		console.error('Notion JSON parse error:', e.message);
@@ -506,7 +507,6 @@ async function createNotionPage(userText) {
 }
 
 // ─── Shortcut mode: быстрые действия БЕЗ DeepSeek ─────────────────────────
-// Добавляем простые блоки прямо на основную страницу Notion (NOTION_PAGE_ID)
 async function appendBlocksToMainPage(blocks) {
 	if (!NOTION_TOKEN || !NOTION_PAGE_ID) {
 		return { ok: false, error: 'Notion не настроен (NOTION_TOKEN / NOTION_PAGE_ID).' };
@@ -824,12 +824,26 @@ async function handleUpdate(upd) {
 	}
 }
 
-// ─── Автономные задачи (AI Agent через node-cron) ─────────────────────────
+// ─── Автономные задачи (планировщик БЕЗ node-cron) ────────────────────────
+// Нативный планировщик: каждую минуту проверяем локальное время в нужной зоне.
 function startScheduledTasks() {
 	const tz = 'Europe/Chisinau';
+	const lastRun = {}; // key -> 'YYYY-MM-DD' (чтобы задача срабатывала раз в день)
 
-	// Доброе утро + план дня (09:00)
-	cron.schedule('0 9 * * *', async () => {
+	const nowInTz = () => {
+		const parts = new Intl.DateTimeFormat('en-CA', {
+			timeZone: tz,
+			year: 'numeric', month: '2-digit', day: '2-digit',
+			hour: '2-digit', minute: '2-digit', hour12: false
+		}).formatToParts(new Date());
+		const o = {};
+		for (const p of parts) o[p.type] = p.value;
+		let hour = parseInt(o.hour, 10);
+		if (hour === 24) hour = 0; // некоторые среды возвращают 24 для полуночи
+		return { date: `${o.year}-${o.month}-${o.day}`, hour, minute: parseInt(o.minute, 10) };
+	};
+
+	const runMorning = async (date) => {
 		try {
 			const todos = await getOpenTodosFromNotion(10);
 			const dateStr = new Date().toLocaleString('ru-RU', { timeZone: tz, dateStyle: 'full' });
@@ -841,11 +855,10 @@ function startScheduledTasks() {
 			}
 			await sendMessage(ALLOWED_USER_ID, text);
 			console.log('🤖 Утреннее сообщение отправлено');
-		} catch (e) { console.error('Cron morning error:', e.message); }
-	}, { timezone: tz });
+		} catch (e) { console.error('Morning task error:', e.message); }
+	};
 
-	// Вечернее напоминание о незакрытых задачах (19:00)
-	cron.schedule('0 19 * * *', async () => {
+	const runEvening = async (date) => {
 		try {
 			const todos = await getOpenTodosFromNotion(10);
 			if (!todos.length) return; // нечего напоминать
@@ -853,8 +866,24 @@ function startScheduledTasks() {
 				todos.map(t => `☐ ${escapeHtml(t)}`).join('\n');
 			await sendMessage(ALLOWED_USER_ID, text);
 			console.log('🤖 Вечернее напоминание отправлено');
-		} catch (e) { console.error('Cron evening error:', e.message); }
-	}, { timezone: tz });
+		} catch (e) { console.error('Evening task error:', e.message); }
+	};
+
+	setInterval(async () => {
+		const { date, hour, minute } = nowInTz();
+
+		// Доброе утро + план дня (09:00)
+		if (hour === 9 && minute === 0 && lastRun.morning !== date) {
+			lastRun.morning = date;
+			await runMorning(date);
+		}
+
+		// Вечернее напоминание (19:00)
+		if (hour === 19 && minute === 0 && lastRun.evening !== date) {
+			lastRun.evening = date;
+			await runEvening(date);
+		}
+	}, 30 * 1000); // проверка каждые 30 секунд
 
 	console.log('⏰ Планировщик задач запущен (09:00 утро, 19:00 напоминание)');
 }
