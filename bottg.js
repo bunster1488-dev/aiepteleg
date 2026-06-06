@@ -639,13 +639,18 @@ async function handleFactsCommand(chatId, text) {
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
-    const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
-      chat_id: chatId,
-      text: text.slice(i, i+4000),
-      parse_mode: 'HTML',
-      reply_markup: replyMarkup
-    });
-    lastId = r?.result?.message_id || lastId;
+    try {
+      const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
+        chat_id: chatId,
+        text: text.slice(i, i+4000),
+        parse_mode: 'HTML',
+        reply_markup: replyMarkup
+      });
+      if (r && r.ok) lastId = r.result?.message_id || lastId;
+      else log('WARN', 'sendMessage ответ не ok:', JSON.stringify(r).slice(0,100));
+    } catch (e) {
+      log('ERROR', 'sendMessage исключение:', e.message);
+    }
   }
   return lastId;
 }
@@ -703,12 +708,12 @@ async function handleFileUpload(chatId, message) {
 
 // ─── Основной обработчик обновлений ────────────────────────────────────
 async function handleUpdate(upd) {
+  // callback_query сначала
   if (upd.callback_query) {
     const q = upd.callback_query;
     const chatId = q.message.chat.id.toString();
     const data = q.data;
     await makeRequest(`${TG_API}/answerCallbackQuery`, 'POST', {}, { callback_query_id: q.id });
-
     if (data.startsWith('fact_del_')) {
       const id = parseInt(data.slice('fact_del_'.length));
       db.run('DELETE FROM facts WHERE id = ?', [id]);
@@ -726,13 +731,14 @@ async function handleUpdate(upd) {
   const userId = upd.message.from.id.toString();
   const chatId = upd.message.chat.id.toString();
   const messageId = upd.message.message_id;
-  const text = upd.message.text || '';
+  const text = (upd.message.text || '').trim();
 
   if (userId !== ALLOWED_USER_ID) {
     await sendMessage(chatId, '⛔ Доступ запрещён.');
     return;
   }
 
+  // Rate limit
   const now = Date.now();
   const entry = userRateLimit.get(userId);
   if (entry && now < entry.resetTime && entry.count >= RATE_LIMIT_MAX) {
@@ -753,9 +759,9 @@ async function handleUpdate(upd) {
     return;
   }
 
-  log('INFO', `[${chatId}] ${text.substring(0, 60)}`);
+  log('INFO', `[${chatId}] ${text}`);
 
-  // Реакция
+  // Реакция (без команд)
   if (!text.startsWith('/')) {
     const emoji = decideReaction(text);
     if (emoji) {
@@ -780,53 +786,9 @@ async function handleUpdate(upd) {
     return;
   }
 
-  // Команды
-  if (text.startsWith('/remind ')) {
-    const parsed = parseReminderTime(text);
-    if (parsed) {
-      db.run('INSERT INTO reminders (chat_id, message, remind_at) VALUES (?, ?, ?)', [chatId, parsed.message, Math.floor(parsed.date.getTime() / 1000)]);
-      saveDatabase();
-      await sendMessage(chatId, `⏰ Напоминание установлено на ${parsed.date.toLocaleString('ru-RU')}:\n${escapeHtml(parsed.message)}`);
-    } else {
-      await sendMessage(chatId, '⚠️ Не удалось распознать время. Пример: /remind через 30 минут проверить почту');
-    }
-    return;
-  }
-  if (text === '/todo' || text.startsWith('/todo ')) {
-    const t = text.replace(/^\/todo\s*/, '').trim();
-    if (!t) { await sendMessage(chatId, '✏️ /todo текст задачи'); return; }
-    await sendMessage(chatId, await quickAddTodo(t));
-    return;
-  }
-  if (text === '/note' || text.startsWith('/note ')) {
-    const t = text.replace(/^\/note\s*/, '').trim();
-    if (!t) { await sendMessage(chatId, '✏️ /note текст заметки'); return; }
-    await sendMessage(chatId, await quickAddNote(t));
-    return;
-  }
-  if (text.startsWith('/facts')) {
-    const res = await handleFactsCommand(chatId, text);
-    await sendMessage(chatId, res.text, res.buttons);
-    return;
-  }
-  if (text.startsWith('/notion')) {
-    const noteText = text.replace(/^\/notion[\s\n]?/, '').trim();
-    if (!noteText) {
-      await sendMessage(chatId, '✏️ /notion твой текст или идея');
-      return;
-    }
-    const pageText = await createNotionPage(noteText);
-    await sendMessage(chatId, pageText);
-    return;
-  }
-  if (text === '/clear') {
-    clearHistory.run(chatId);
-    delete chatHistories[chatId];
-    saveDatabase();
-    await sendMessage(chatId, '🧹 История диалога очищена.');
-    return;
-  }
+  // ================= КОМАНДЫ (первыми /help) =================
   if (text === '/help' || text === '/start') {
+    const panelUrl = `${RENDER_URL}/panel?token=bunst-8524-588`;
     const helpText = `👋 <b>Я — твой умный помощник!</b>\n\n` +
       `💬 <b>Общение:</b> просто пиши, я отвечаю и запоминаю важное.\n` +
       `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
@@ -839,16 +801,74 @@ async function handleUpdate(upd) {
       `/facts – показать/управлять фактами памяти (кнопки).\n` +
       `/facts add [текст] – сохранить факт.\n` +
       `/facts find [запрос] – найти факты.\n` +
-      `/facts delete <номер> – удалить факт (через кнопки).\n` +
       `/clear – очистить историю диалога.\n` +
       `🔗 <b>Ссылки:</b> отправь URL — я сделаю краткую сводку.\n` +
       `📎 <b>Файлы:</b> отправь фото или документ — загружу в Notion.\n` +
-      `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о незакрытых задачах из Notion.`;
-    await sendMessage(chatId, helpText);
+      `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о задачах из Notion.\n` +
+      `🌐 <b>Веб-панель:</b> ${panelUrl}`;
+
+    try {
+      const msgId = await sendMessage(chatId, helpText);
+      log('INFO', '/help отправлено успешно, msgId:', msgId);
+    } catch (e) {
+      log('ERROR', 'Ошибка отправки /help:', e.message);
+      await sendMessage(chatId, '⚠️ Не удалось отправить справку.');
+    }
     return;
   }
 
-  // Основной диалог
+  if (text.startsWith('/remind ')) {
+    const parsed = parseReminderTime(text);
+    if (parsed) {
+      db.run('INSERT INTO reminders (chat_id, message, remind_at) VALUES (?, ?, ?)', [chatId, parsed.message, Math.floor(parsed.date.getTime() / 1000)]);
+      saveDatabase();
+      await sendMessage(chatId, `⏰ Напоминание установлено на ${parsed.date.toLocaleString('ru-RU')}:\n${escapeHtml(parsed.message)}`);
+    } else {
+      await sendMessage(chatId, '⚠️ Не удалось распознать время. Пример: /remind через 30 минут проверить почту');
+    }
+    return;
+  }
+
+  if (text === '/todo' || text.startsWith('/todo ')) {
+    const t = text.replace(/^\/todo\s*/, '').trim();
+    if (!t) { await sendMessage(chatId, '✏️ /todo текст задачи'); return; }
+    await sendMessage(chatId, await quickAddTodo(t));
+    return;
+  }
+
+  if (text === '/note' || text.startsWith('/note ')) {
+    const t = text.replace(/^\/note\s*/, '').trim();
+    if (!t) { await sendMessage(chatId, '✏️ /note текст заметки'); return; }
+    await sendMessage(chatId, await quickAddNote(t));
+    return;
+  }
+
+  if (text.startsWith('/facts')) {
+    const res = await handleFactsCommand(chatId, text);
+    await sendMessage(chatId, res.text, res.buttons);
+    return;
+  }
+
+  if (text.startsWith('/notion')) {
+    const noteText = text.replace(/^\/notion[\s\n]?/, '').trim();
+    if (!noteText) {
+      await sendMessage(chatId, '✏️ /notion твой текст или идея');
+      return;
+    }
+    const pageText = await createNotionPage(noteText);
+    await sendMessage(chatId, pageText);
+    return;
+  }
+
+  if (text === '/clear') {
+    clearHistory.run(chatId);
+    delete chatHistories[chatId];
+    saveDatabase();
+    await sendMessage(chatId, '🧹 История диалога очищена.');
+    return;
+  }
+
+  // Если команда не распознана – основной диалог
   await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
 
   let searchContext = '';
