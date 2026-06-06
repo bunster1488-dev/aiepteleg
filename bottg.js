@@ -639,18 +639,13 @@ async function handleFactsCommand(chatId, text) {
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
-    try {
-      const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
-        chat_id: chatId,
-        text: text.slice(i, i+4000),
-        parse_mode: 'HTML',
-        reply_markup: replyMarkup
-      });
-      if (r && r.ok) lastId = r.result?.message_id || lastId;
-      else log('WARN', 'Ошибка при отправке сообщения:', r);
-    } catch (e) {
-      log('ERROR', 'Не удалось отправить сообщение:', e.message);
-    }
+    const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, {
+      chat_id: chatId,
+      text: text.slice(i, i+4000),
+      parse_mode: 'HTML',
+      reply_markup: replyMarkup
+    });
+    lastId = r?.result?.message_id || lastId;
   }
   return lastId;
 }
@@ -832,7 +827,6 @@ async function handleUpdate(upd) {
     return;
   }
   if (text === '/help' || text === '/start') {
-    const panelUrl = `${RENDER_URL}/panel?token=bunst-8524-588`;
     const helpText = `👋 <b>Я — твой умный помощник!</b>\n\n` +
       `💬 <b>Общение:</b> просто пиши, я отвечаю и запоминаю важное.\n` +
       `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
@@ -849,15 +843,8 @@ async function handleUpdate(upd) {
       `/clear – очистить историю диалога.\n` +
       `🔗 <b>Ссылки:</b> отправь URL — я сделаю краткую сводку.\n` +
       `📎 <b>Файлы:</b> отправь фото или документ — загружу в Notion.\n` +
-      `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о незакрытых задачах из Notion.\n` +
-      `🌐 <b>Веб-панель:</b> ${panelUrl}`;
-    try {
-      const msgId = await sendMessage(chatId, helpText);
-      log('INFO', '/help отправлено, msgId:', msgId);
-    } catch (e) {
-      log('ERROR', 'Ошибка отправки /help:', e.message);
-      await sendMessage(chatId, 'Произошла ошибка при отправке помощи.');
-    }
+      `⏰ <b>Автономные задачи:</b> утром (09:00) план дня, вечером (19:00) напоминание о незакрытых задачах из Notion.`;
+    await sendMessage(chatId, helpText);
     return;
   }
 
