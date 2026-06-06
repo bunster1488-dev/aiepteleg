@@ -978,6 +978,22 @@ function servePanel(req, res) {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getFactsJSON()));
+    } else if (req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try {
+          const { text } = JSON.parse(body);
+          if (!text || !text.trim()) throw new Error('Пустой текст');
+          const success = addFact(text.trim());
+          if (!success) throw new Error('Дубликат');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
     } else if (req.method === 'DELETE') {
       let body = '';
       req.on('data', c => body += c);
@@ -1041,25 +1057,107 @@ function getPanelHTML() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Панель бота</title>
   <style>
-    body { font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-    h1 { color: #333; }
-    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
-    .tab { padding: 10px 20px; background: #ddd; border-radius: 5px 5px 0 0; cursor: pointer; }
-    .tab.active { background: white; font-weight: bold; }
-    .content { background: white; padding: 20px; border-radius: 0 5px 5px 5px; min-height: 200px; }
-    .item { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #eee; }
-    .item button { background: #e74c3c; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; }
+    :root {
+      --bg: #1e1e2e;
+      --surface: #2a2a3c;
+      --text: #e0e0e0;
+      --text-secondary: #a0a0b0;
+      --accent: #7c8cf8;
+      --danger: #e74c3c;
+      --border: #3a3a4e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 20px;
+      min-height: 100vh;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 1rem; color: #fff; }
+    .tabs { display: flex; gap: 5px; margin-bottom: 20px; }
+    .tab {
+      padding: 10px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px 8px 0 0;
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-weight: 500;
+      transition: 0.2s;
+    }
+    .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .content {
+      background: var(--surface);
+      padding: 20px;
+      border-radius: 0 8px 8px 8px;
+      border: 1px solid var(--border);
+      min-height: 300px;
+    }
     .hidden { display: none; }
+    .item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .item span { flex: 1; margin-right: 10px; }
+    .item button {
+      background: var(--danger);
+      color: white;
+      border: none;
+      padding: 4px 12px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    .add-form {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .add-form input {
+      flex: 1;
+      padding: 10px 15px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 1rem;
+    }
+    .add-form button {
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: white;
+      font-weight: bold;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+    .add-form button:hover { opacity: 0.9; }
+    .empty { color: var(--text-secondary); text-align: center; padding: 40px 0; }
+    .history-item { padding: 8px 0; border-bottom: 1px solid var(--border); }
+    .history-role { font-weight: bold; color: var(--accent); text-transform: capitalize; }
+    .history-content { margin: 4px 0 0 10px; color: var(--text); }
+    .history-date { font-size: 0.8rem; color: var(--text-secondary); }
   </style>
 </head>
 <body>
-  <h1>🤖 Панель управления ботом</h1>
+  <h1>🤖 Панель управления</h1>
   <div class="tabs">
     <div class="tab active" onclick="showTab('facts')">Факты</div>
     <div class="tab" onclick="showTab('reminders')">Напоминания</div>
     <div class="tab" onclick="showTab('history')">История</div>
   </div>
-  <div id="facts" class="content"></div>
+  <div id="facts" class="content">
+    <div class="add-form">
+      <input id="factInput" type="text" placeholder="Новый факт...">
+      <button onclick="addFact()">➕ Добавить</button>
+    </div>
+    <div id="factList"></div>
+  </div>
   <div id="reminders" class="content hidden"></div>
   <div id="history" class="content hidden"></div>
 
@@ -1077,17 +1175,41 @@ function getPanelHTML() {
       if (name === 'history') loadHistory();
     }
 
+    async function addFact() {
+      const input = document.getElementById('factInput');
+      const text = input.value.trim();
+      if (!text) return;
+      try {
+        const res = await fetch(\`\${BASE}/facts?token=\${token}\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        if (!res.ok) { const err = await res.json(); alert(err.error || 'Ошибка'); return; }
+        input.value = '';
+        await loadFacts();
+      } catch (e) { alert('Ошибка сети'); }
+    }
+
     async function loadFacts() {
-      const res = await fetch(\`\${BASE}/facts?token=\${token}\`);
-      const facts = await res.json();
-      document.getElementById('facts').innerHTML = '<h3>Факты</h3>' + facts.map(f =>
-        \`<div class="item"><span>\${escapeHtml(f.text)}</span><button onclick="deleteFact(\${f.id})">Удалить</button></div>\`
-      ).join('');
+      try {
+        const res = await fetch(\`\${BASE}/facts?token=\${token}\`);
+        const facts = await res.json();
+        const container = document.getElementById('factList');
+        if (!facts.length) {
+          container.innerHTML = '<div class="empty">🧠 Фактов пока нет</div>';
+          return;
+        }
+        container.innerHTML = facts.map(f =>
+          \`<div class="item"><span>\${escapeHtml(f.text)}</span><button onclick="deleteFact(\${f.id})">🗑</button></div>\`
+        ).join('');
+      } catch (e) { console.error(e); }
     }
 
     async function deleteFact(id) {
       await fetch(\`\${BASE}/facts?token=\${token}\`, {
         method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id })
       });
       loadFacts();
@@ -1096,25 +1218,42 @@ function getPanelHTML() {
     async function loadReminders() {
       const res = await fetch(\`\${BASE}/reminders?token=\${token}\`);
       const rems = await res.json();
-      document.getElementById('reminders').innerHTML = '<h3>Напоминания</h3>' + rems.map(r =>
-        \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">Удалить</button></div>\`
+      const container = document.getElementById('reminders');
+      if (!rems.length) {
+        container.innerHTML = '<div class="empty">⏰ Напоминаний нет</div>';
+        return;
+      }
+      container.innerHTML = rems.map(r =>
+        \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">🗑</button></div>\`
       ).join('');
     }
 
     async function deleteReminder(id) {
       await fetch(\`\${BASE}/reminders?token=\${token}\`, {
         method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id })
       });
       loadReminders();
     }
 
     async function loadHistory() {
-      const res = await fetch(\`\${BASE}/history?token=\${token}\`);
-      const items = await res.json();
-      document.getElementById('history').innerHTML = '<h3>Последние сообщения</h3>' + items.map(i =>
-        \`<div class="item"><b>\${i.role}:</b> \${escapeHtml(i.content).substring(0,100)} <small>\${i.date}</small></div>\`
-      ).join('');
+      try {
+        const res = await fetch(\`\${BASE}/history?token=\${token}\`);
+        const items = await res.json();
+        const container = document.getElementById('history');
+        if (!items.length) {
+          container.innerHTML = '<div class="empty">📭 История пуста</div>';
+          return;
+        }
+        container.innerHTML = items.map(i =>
+          \`<div class="history-item">
+            <span class="history-role">\${i.role}:</span>
+            <div class="history-content">\${escapeHtml(i.content).substring(0,150)}</div>
+            <div class="history-date">\${i.date}</div>
+          </div>\`
+        ).join('');
+      } catch (e) { console.error(e); }
     }
 
     function escapeHtml(s) {
