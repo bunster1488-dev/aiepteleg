@@ -6,11 +6,13 @@
     "start": "node bottg.js"
   },
   "dependencies": {
-    "node-fetch": "^2.6.7",
+    "sql.js": "^1.8.0",
+    "chrono-node": "^2.6.6",
+    "@extractus/article-extractor": "^7.1.10",
+    "form-data": "^4.0.0",
     "duck-duck-scrape": "^2.2.3"
   },
   "engines": {
     "node": ">=18.0.0"
   }
 }
-
