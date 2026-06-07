@@ -35,30 +35,8 @@ const log = (level, ...args) => {
   }
 };
 
-// ─── HTTP‑запросы (без keepAliveAgent) ─────────────────────────────────
-function makeRequest(url, method = 'POST', headers = {}, body = null) {
-  return new Promise((resolve) => {
-    let parsedUrl;
-    try { parsedUrl = new URL(url); } catch (e) { return resolve(null); }
-    const options = {
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname + parsedUrl.search,
-      method,
-      timeout: 12000,
-      headers: { 'Content-Type': 'application/json', ...headers }
-    };
-    const req = https.request(options, (res) => {
-      let buf = '';
-      res.on('data', d => buf += d);
-      res.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); } });
-    });
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', (e) => { log('ERROR', e.message); resolve(null); });
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
-}
-
+// ─── HTTP‑агент с таймаутами ───────────────────────────────────────────
+const keepAliveAgent = new https.Agent({ keepAlive: true, timeout: 15000 });
 const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 // ─── Глобальные in‑memory кеши ─────────────────────────────────────────
@@ -122,6 +100,7 @@ async function initDatabase() {
   if (facts.length && facts[0].values) {
     factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
   }
+
   log('INFO', 'База данных SQL.js инициализирована');
 }
 
@@ -131,7 +110,7 @@ function saveDatabase() {
   fs.writeFileSync(DB_FILE, buffer);
 }
 
-// ─── Миграция из SheetDB ───────────────────────────────────────────────
+// ─── Миграция из SheetDB (если указан) ─────────────────────────────────
 async function migrateFromSheetDB() {
   if (!SHEETDB_URL) return;
   try {
@@ -172,6 +151,31 @@ function formatAiResponse(thinking, answer) {
   return res + ans;
 }
 
+// ─── HTTP‑запросы ──────────────────────────────────────────────────────
+function makeRequest(url, method = 'POST', headers = {}, body = null) {
+  return new Promise((resolve) => {
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch (e) { return resolve(null); }
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method,
+      agent: keepAliveAgent,
+      timeout: 12000,
+      headers: { 'Content-Type': 'application/json', ...headers }
+    };
+    const req = https.request(options, (res) => {
+      let buf = '';
+      res.on('data', d => buf += d);
+      res.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', (e) => { log('ERROR', e.message); resolve(null); });
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
 // ─── DeepSeek стрим (сбор без редактирования) ─────────────────────────
 function streamDeepSeek(messages) {
   return new Promise((resolve) => {
@@ -180,6 +184,7 @@ function streamDeepSeek(messages) {
       hostname: url.hostname,
       path: url.pathname,
       method: 'POST',
+      agent: keepAliveAgent,
       timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
@@ -207,23 +212,11 @@ function streamDeepSeek(messages) {
           } catch (e) {}
         }
       });
-      res.on('end', () => {
-        resolve({ reasoning, answer });
-      });
+      res.on('end', () => resolve({ reasoning, answer }));
     });
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ reasoning: '', answer: '', timedOut: true });
-    });
-    req.on('error', (e) => {
-      log('ERROR', 'Stream error:', e.message);
-      resolve({ reasoning: '', answer: '' });
-    });
-    req.write(JSON.stringify({
-      model: 'deepseek-reasoner',
-      messages,
-      stream: true
-    }));
+    req.on('timeout', () => { req.destroy(); resolve({ reasoning: '', answer: '', timedOut: true }); });
+    req.on('error', (e) => { log('ERROR', e.message); resolve({ reasoning: '', answer: '' }); });
+    req.write(JSON.stringify({ model: 'deepseek-reasoner', messages, stream: true }));
     req.end();
   });
 }
@@ -275,7 +268,7 @@ function addFact(text) {
   return true;
 }
 
-// ─── Реакции ───────────────────────────────────────────────────────────
+// ─── Реакции вместо ответа ─────────────────────────────────────────────
 function decideReaction(text) {
   const t = (text || '').toLowerCase().trim();
   if (!t || t.length > 60 || t.startsWith('/') || /[?？]/.test(t) || needsSearch(t)) return null;
@@ -298,7 +291,7 @@ async function setReaction(chatId, messageId, emoji) {
   return makeRequest(`${TG_API}/setMessageReaction`, 'POST', {}, { chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] });
 }
 
-// ─── Поиск ─────────────────────────────────────────────────────────────
+// ─── Поиск в интернете ─────────────────────────────────────────────────
 function needsSearch(text) {
   const triggers = ['найди','поищи','погугли','что такое','кто такой','кто такая','расскажи про','расскажи о','узнай','сколько стоит','где находится','последние новости','новости про','что случилось','курс ','погода','price','search','find','what is','who is'];
   return triggers.some(t => text.toLowerCase().includes(t));
@@ -311,7 +304,7 @@ async function searchWeb(query) {
   } catch (e) { log('ERROR', 'Search error:', e.message); return null; }
 }
 
-// ─── Суммаризация ссылок ──────────────────────────────────────────────
+// ─── Суммаризация ссылок ───────────────────────────────────────────────
 async function summarizeUrl(url) {
   try {
     const article = await extract(url);
@@ -475,6 +468,8 @@ async function quickAddNote(text) {
   const res = await appendBlocksToMainPage([{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: text } }] } }]);
   return res.ok ? `✅ Заметка добавлена:\n📝 ${escapeHtml(text)}` : `❌ Не удалось: ${res.error}`;
 }
+
+// ─── Загрузка файлов в Notion ───────────────────────────────────────────
 async function getTelegramFileUrl(fileId) {
   const res = await makeRequest(`${TG_API}/getFile?file_id=${fileId}`, 'GET');
   if (res?.result?.file_path) {
@@ -561,7 +556,7 @@ async function addBlockToNotionPage(type, url, fileName) {
   );
 }
 
-// ─── Напоминания ───────────────────────────────────────────────────────
+// ─── Напоминания ────────────────────────────────────────────────────────
 function parseReminderTime(text) {
   const clean = text.replace(/^\/remind\s+/, '');
   const results = chrono.parse(clean, new Date(), { forwardDate: true });
@@ -585,7 +580,7 @@ async function processReminders() {
   }
 }
 
-// ─── Обработка фактов с кнопками ──────────────────────────────────────
+// ─── Обработка фактов с кнопками ───────────────────────────────────────
 async function handleFactsCommand(chatId, text) {
   if (text === '/facts') {
     if (!factsStore.length) return { text: '🗒 Память пуста.', buttons: null };
@@ -610,7 +605,7 @@ async function handleFactsCommand(chatId, text) {
   return { text: 'Неизвестная команда. Используйте /facts, /facts add, /facts find, /facts delete номер', buttons: null };
 }
 
-// ─── Отправка сообщений ───────────────────────────────────────────────
+// ─── Отправка сообщений с кнопками ──────────────────────────────────────
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
@@ -628,7 +623,7 @@ async function editMessage(chatId, messageId, text, replyMarkup = null) {
   });
 }
 
-// ─── Обработка файлов ─────────────────────────────────────────────────
+// ─── Обработка файлов ──────────────────────────────────────────────────
 async function handleFileUpload(chatId, message) {
   let fileId, fileName = 'file', mimeType = 'application/octet-stream';
   if (message.photo) {
@@ -665,8 +660,9 @@ async function handleFileUpload(chatId, message) {
   }
 }
 
-// ─── Основной обработчик обновлений ───────────────────────────────────
+// ─── Основной обработчик обновлений ────────────────────────────────────
 async function handleUpdate(upd) {
+  // Обработка callback_query
   if (upd.callback_query) {
     const q = upd.callback_query;
     const chatId = q.message.chat.id.toString();
@@ -784,7 +780,7 @@ async function handleUpdate(upd) {
       return;
     }
 
-    // 1. Поиск страниц
+    // Поиск страниц
     const pages = await readNotionPages(noteText);
     if (pages.length === 0) {
       // Ничего не найдено – предлагаем создать
