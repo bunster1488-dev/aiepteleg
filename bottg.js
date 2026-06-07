@@ -35,8 +35,30 @@ const log = (level, ...args) => {
   }
 };
 
-// ─── HTTP‑агент с таймаутами ───────────────────────────────────────────
-const keepAliveAgent = new https.Agent({ keepAlive: true, timeout: 15000 });
+// ─── HTTP‑запросы (без keepAliveAgent) ─────────────────────────────────
+function makeRequest(url, method = 'POST', headers = {}, body = null) {
+  return new Promise((resolve) => {
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch (e) { return resolve(null); }
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method,
+      timeout: 12000,
+      headers: { 'Content-Type': 'application/json', ...headers }
+    };
+    const req = https.request(options, (res) => {
+      let buf = '';
+      res.on('data', d => buf += d);
+      res.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', (e) => { log('ERROR', e.message); resolve(null); });
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
 const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 // ─── Глобальные in‑memory кеши ─────────────────────────────────────────
@@ -100,7 +122,6 @@ async function initDatabase() {
   if (facts.length && facts[0].values) {
     factsStore = facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null }));
   }
-
   log('INFO', 'База данных SQL.js инициализирована');
 }
 
@@ -110,7 +131,7 @@ function saveDatabase() {
   fs.writeFileSync(DB_FILE, buffer);
 }
 
-// ─── Миграция из SheetDB (если указан) ─────────────────────────────────
+// ─── Миграция из SheetDB ───────────────────────────────────────────────
 async function migrateFromSheetDB() {
   if (!SHEETDB_URL) return;
   try {
@@ -151,57 +172,60 @@ function formatAiResponse(thinking, answer) {
   return res + ans;
 }
 
-// ─── HTTP‑запросы ──────────────────────────────────────────────────────
-function makeRequest(url, method = 'POST', headers = {}, body = null) {
+// ─── DeepSeek стрим (сбор без редактирования) ─────────────────────────
+function streamDeepSeek(messages) {
   return new Promise((resolve) => {
-    let parsedUrl;
-    try { parsedUrl = new URL(url); } catch (e) { return resolve(null); }
+    const url = new URL('https://api.deepseek.com/v1/chat/completions');
     const options = {
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname + parsedUrl.search,
-      method,
-      agent: keepAliveAgent,
-      timeout: 12000,
-      headers: { 'Content-Type': 'application/json', ...headers }
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      timeout: 30000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+      }
     };
     const req = https.request(options, (res) => {
-      let buf = '';
-      res.on('data', d => buf += d);
-      res.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { resolve(buf); } });
+      res.setEncoding('utf8');
+      let buffer = '', reasoning = '', answer = '';
+      res.on('data', (chunk) => {
+        buffer += chunk;
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          const s = line.trim();
+          if (!s.startsWith('data:')) continue;
+          const data = s.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const json = JSON.parse(data);
+            const delta = json.choices?.[0]?.delta || {};
+            if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
+            if (delta.content) { answer += delta.content; }
+          } catch (e) {}
+        }
+      });
+      res.on('end', () => {
+        resolve({ reasoning, answer });
+      });
     });
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', (e) => { log('ERROR', e.message); resolve(null); });
-    if (body) req.write(JSON.stringify(body));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ reasoning: '', answer: '', timedOut: true });
+    });
+    req.on('error', (e) => {
+      log('ERROR', 'Stream error:', e.message);
+      resolve({ reasoning: '', answer: '' });
+    });
+    req.write(JSON.stringify({
+      model: 'deepseek-reasoner',
+      messages,
+      stream: true
+    }));
     req.end();
   });
-}
-
-// ─── DeepSeek обычный (непотоковый) запрос ─────────────────────────────
-async function callDeepSeek(messages) {
-  const body = {
-    model: 'deepseek-reasoner',
-    messages,
-    stream: false
-  };
-  log('INFO', 'Запрос к DeepSeek...');
-  const res = await makeRequest(
-    'https://api.deepseek.com/v1/chat/completions',
-    'POST',
-    {
-      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body
-  );
-  if (!res || !res.choices) {
-    log('ERROR', 'DeepSeek ответил невалидным JSON:', JSON.stringify(res).slice(0, 200));
-    return { reasoning: '', answer: '' };
-  }
-  const msg = res.choices[0]?.message || {};
-  const reasoning = msg.reasoning_content || '';
-  const answer = msg.content || '';
-  log('INFO', 'DeepSeek ответ получен. Длина ответа:', answer.length);
-  return { reasoning, answer };
 }
 
 // ─── RAG‑lite факты ────────────────────────────────────────────────────
@@ -211,19 +235,15 @@ const STOPWORDS = new Set([
   'вот','от','меня','еще','нет','о','из','ему','теперь','когда','даже','ну','вдруг',
   'ли','если','уже','или','быть','был','него','до','вас','нибудь','опять','уж','вам'
 ]);
-
 function normalizeToken(w) {
   w = w.toLowerCase().replace(/[^a-zа-яё0-9]/gi, '');
   if (w.length <= 4) return w;
   return w.replace(/(ами|ями|ого|его|ому|ему|ыми|ими|ах|ях|ов|ев|ам|ям|ой|ей|ую|юю|ие|ые|ий|ый|ая|яя|ть|ешь|ет|ут|ют|ла|ло|ли|на|ка)$/i, '');
 }
-
 function tokenize(text) {
   return (text || '').split(/\s+/).map(normalizeToken).filter(t => t && t.length > 2 && !STOPWORDS.has(t));
 }
-
 function embedText(text) { return tokenize(text); }
-
 function scoreFact(qTokens, fTokens) {
   if (!qTokens.length || !fTokens.length) return 0;
   const qset = new Set(qTokens);
@@ -232,7 +252,6 @@ function scoreFact(qTokens, fTokens) {
   const union = new Set([...qTokens, ...fTokens]).size;
   return overlap / Math.sqrt(union || 1);
 }
-
 function retrieveRelevantFacts(query, limit = 6) {
   if (!factsStore.length) return '';
   const qTokens = embedText(query);
@@ -244,7 +263,6 @@ function retrieveRelevantFacts(query, limit = 6) {
   if (chosen.length === 0) chosen = factsStore.slice(-limit).map(f => f.text);
   return chosen.join(' | ');
 }
-
 function addFact(text) {
   const clean = (text || '').trim();
   if (!clean) return false;
@@ -257,7 +275,7 @@ function addFact(text) {
   return true;
 }
 
-// ─── Реакции вместо ответа ─────────────────────────────────────────────
+// ─── Реакции ───────────────────────────────────────────────────────────
 function decideReaction(text) {
   const t = (text || '').toLowerCase().trim();
   if (!t || t.length > 60 || t.startsWith('/') || /[?？]/.test(t) || needsSearch(t)) return null;
@@ -276,17 +294,15 @@ function decideReaction(text) {
   for (const r of rules) if (r.test.test(t)) return r.set[Math.floor(Math.random() * r.set.length)];
   return null;
 }
-
 async function setReaction(chatId, messageId, emoji) {
   return makeRequest(`${TG_API}/setMessageReaction`, 'POST', {}, { chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] });
 }
 
-// ─── Поиск в интернете ─────────────────────────────────────────────────
+// ─── Поиск ─────────────────────────────────────────────────────────────
 function needsSearch(text) {
   const triggers = ['найди','поищи','погугли','что такое','кто такой','кто такая','расскажи про','расскажи о','узнай','сколько стоит','где находится','последние новости','новости про','что случилось','курс ','погода','price','search','find','what is','who is'];
   return triggers.some(t => text.toLowerCase().includes(t));
 }
-
 async function searchWeb(query) {
   try {
     const results = await ddg.search(query, { safeSearch: ddg.SafeSearchType.MODERATE });
@@ -295,7 +311,7 @@ async function searchWeb(query) {
   } catch (e) { log('ERROR', 'Search error:', e.message); return null; }
 }
 
-// ─── Суммаризация ссылок ───────────────────────────────────────────────
+// ─── Суммаризация ссылок ──────────────────────────────────────────────
 async function summarizeUrl(url) {
   try {
     const article = await extract(url);
@@ -327,7 +343,6 @@ function formatNotionId(id) {
   if (clean.length !== 32) return null;
   return `${clean.slice(0,8)}-${clean.slice(8,12)}-${clean.slice(12,16)}-${clean.slice(16,20)}-${clean.slice(20)}`;
 }
-
 async function formatForNotion(userText) {
   const res = await makeRequest(
     'https://api.deepseek.com/v1/chat/completions',
@@ -352,7 +367,6 @@ async function formatForNotion(userText) {
     return JSON.parse(raw);
   } catch (e) { log('ERROR', 'Notion JSON parse:', e.message); return null; }
 }
-
 function buildNotionBlocks(blocks) {
   return blocks.map(b => {
     const richText = (text) => [{ type: 'text', text: { content: text || '' } }];
@@ -370,7 +384,6 @@ function buildNotionBlocks(blocks) {
     }
   });
 }
-
 async function readNotionPages(query = '') {
   if (!NOTION_TOKEN) return [];
   const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
@@ -384,7 +397,6 @@ async function readNotionPages(query = '') {
     return { id: page.id, title, url: page.url };
   });
 }
-
 async function readNotionPageContent(pageId, depth = 0) {
   if (depth > 3) return '';
   const notionHeaders = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' };
@@ -417,7 +429,6 @@ async function readNotionPageContent(pageId, depth = 0) {
   }
   return lines.filter(Boolean).join('\n');
 }
-
 async function createNotionPage(userText) {
   const formatted = await formatForNotion(userText);
   if (!formatted) return '❌ Не удалось оформить заметку.';
@@ -443,7 +454,6 @@ async function createNotionPage(userText) {
     return `❌ Неверный токен. NOTION_TOKEN должен начинаться с secret_`;
   return `❌ Ошибка Notion: ${errMsg}`;
 }
-
 async function appendBlocksToMainPage(blocks) {
   if (!NOTION_TOKEN || !NOTION_PAGE_ID) return { ok: false, error: 'Notion не настроен.' };
   const pageId = formatNotionId(NOTION_PAGE_ID);
@@ -457,18 +467,14 @@ async function appendBlocksToMainPage(blocks) {
   if (res?.results || res?.object === 'list') return { ok: true };
   return { ok: false, error: res?.message || JSON.stringify(res) };
 }
-
 async function quickAddTodo(text) {
   const res = await appendBlocksToMainPage([{ object: 'block', type: 'to_do', to_do: { rich_text: [{ type: 'text', text: { content: text } }], checked: false } }]);
   return res.ok ? `✅ Задача добавлена:\n☐ ${escapeHtml(text)}` : `❌ Не удалось: ${res.error}`;
 }
-
 async function quickAddNote(text) {
   const res = await appendBlocksToMainPage([{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: text } }] } }]);
   return res.ok ? `✅ Заметка добавлена:\n📝 ${escapeHtml(text)}` : `❌ Не удалось: ${res.error}`;
 }
-
-// ─── Загрузка файлов в Notion ───────────────────────────────────────────
 async function getTelegramFileUrl(fileId) {
   const res = await makeRequest(`${TG_API}/getFile?file_id=${fileId}`, 'GET');
   if (res?.result?.file_path) {
@@ -476,7 +482,6 @@ async function getTelegramFileUrl(fileId) {
   }
   return null;
 }
-
 function downloadFile(url) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? https : http;
@@ -490,7 +495,6 @@ function downloadFile(url) {
     }).on('error', reject);
   });
 }
-
 async function uploadFileToNotion(fileBuffer, fileName, contentType) {
   if (!NOTION_TOKEN || !NOTION_PAGE_ID) throw new Error('Notion не настроен');
   const form = new FormData();
@@ -526,7 +530,6 @@ async function uploadFileToNotion(fileBuffer, fileName, contentType) {
     form.pipe(req);
   });
 }
-
 async function addBlockToNotionPage(type, url, fileName) {
   const pageId = formatNotionId(NOTION_PAGE_ID);
   if (!pageId) return;
@@ -558,9 +561,8 @@ async function addBlockToNotionPage(type, url, fileName) {
   );
 }
 
-// ─── Напоминания ────────────────────────────────────────────────────────
+// ─── Напоминания ───────────────────────────────────────────────────────
 function parseReminderTime(text) {
-  // поддерживает как команду /remind, так и обычный текст
   const clean = text.replace(/^\/remind\s+/, '');
   const results = chrono.parse(clean, new Date(), { forwardDate: true });
   if (results.length > 0) {
@@ -571,22 +573,19 @@ function parseReminderTime(text) {
   }
   return null;
 }
-
 async function processReminders() {
   const now = Math.floor(Date.now() / 1000);
   const due = db.exec(`SELECT * FROM reminders WHERE remind_at <= ${now}`);
   if (due.length && due[0].values) {
     for (const row of due[0].values) {
-      try {
-        await sendMessage(row[1], `⏰ <b>Напоминание:</b>\n${escapeHtml(row[2])}`);
-      } catch (e) { log('ERROR', 'Reminder send:', e.message); }
+      try { await sendMessage(row[1], `⏰ <b>Напоминание:</b>\n${escapeHtml(row[2])}`); } catch (e) {}
       db.run('DELETE FROM reminders WHERE id = ?', [row[0]]);
     }
     saveDatabase();
   }
 }
 
-// ─── Обработка фактов с кнопками ───────────────────────────────────────
+// ─── Обработка фактов с кнопками ──────────────────────────────────────
 async function handleFactsCommand(chatId, text) {
   if (text === '/facts') {
     if (!factsStore.length) return { text: '🗒 Память пуста.', buttons: null };
@@ -611,43 +610,30 @@ async function handleFactsCommand(chatId, text) {
   return { text: 'Неизвестная команда. Используйте /facts, /facts add, /facts find, /facts delete номер', buttons: null };
 }
 
-// ─── Отправка сообщений с кнопками ──────────────────────────────────────
+// ─── Отправка сообщений ───────────────────────────────────────────────
 async function sendMessage(chatId, text, replyMarkup = null) {
   let lastId = null;
   for (let i = 0; i < text.length; i += 4000) {
-    const body = {
-      chat_id: chatId,
-      text: text.slice(i, i+4000),
-      parse_mode: 'HTML'
-    };
-    if (replyMarkup) {
-      body.reply_markup = replyMarkup;
-    }
+    const body = { chat_id: chatId, text: text.slice(i, i+4000), parse_mode: 'HTML' };
+    if (replyMarkup) body.reply_markup = replyMarkup;
     const r = await makeRequest(`${TG_API}/sendMessage`, 'POST', {}, body);
     if (r && r.ok) lastId = r.result?.message_id || lastId;
     else log('WARN', 'sendMessage не ok:', JSON.stringify(r).slice(0,200));
   }
   return lastId;
 }
-
 async function editMessage(chatId, messageId, text, replyMarkup = null) {
   return makeRequest(`${TG_API}/editMessageText`, 'POST', {}, {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
-    parse_mode: 'HTML',
-    reply_markup: replyMarkup
+    chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', reply_markup: replyMarkup
   });
 }
 
-// ─── Обработка файлов ──────────────────────────────────────────────────
+// ─── Обработка файлов ─────────────────────────────────────────────────
 async function handleFileUpload(chatId, message) {
   let fileId, fileName = 'file', mimeType = 'application/octet-stream';
   if (message.photo) {
     const photo = message.photo[message.photo.length - 1];
-    fileId = photo.file_id;
-    mimeType = 'image/jpeg';
-    fileName = 'photo.jpg';
+    fileId = photo.file_id; mimeType = 'image/jpeg'; fileName = 'photo.jpg';
   } else if (message.document) {
     fileId = message.document.file_id;
     fileName = message.document.file_name || 'document';
@@ -661,9 +647,7 @@ async function handleFileUpload(chatId, message) {
     fileName = message.audio.file_name || 'audio.ogg';
     mimeType = message.audio.mime_type || 'audio/ogg';
   } else if (message.voice) {
-    fileId = message.voice.file_id;
-    fileName = 'voice.ogg';
-    mimeType = 'audio/ogg';
+    fileId = message.voice.file_id; fileName = 'voice.ogg'; mimeType = 'audio/ogg';
   } else return;
 
   try {
@@ -681,7 +665,7 @@ async function handleFileUpload(chatId, message) {
   }
 }
 
-// ─── Основной обработчик обновлений ────────────────────────────────────
+// ─── Основной обработчик обновлений ───────────────────────────────────
 async function handleUpdate(upd) {
   if (upd.callback_query) {
     const q = upd.callback_query;
@@ -698,6 +682,10 @@ async function handleUpdate(upd) {
       await editMessage(chatId, q.message.message_id, '🗑 Факт удалён.');
     } else if (data === 'fact_add_prompt') {
       await sendMessage(chatId, '✏️ Используйте /facts add <текст> для добавления.');
+    } else if (data.startsWith('notion_create_')) {
+      const userText = data.slice('notion_create_'.length);
+      const pageText = await createNotionPage(userText);
+      await sendMessage(chatId, pageText);
     }
     return;
   }
@@ -795,8 +783,19 @@ async function handleUpdate(upd) {
       await sendMessage(chatId, '✏️ /notion твой текст или идея');
       return;
     }
-    const pageText = await createNotionPage(noteText);
-    await sendMessage(chatId, pageText);
+
+    // 1. Поиск страниц
+    const pages = await readNotionPages(noteText);
+    if (pages.length === 0) {
+      // Ничего не найдено – предлагаем создать
+      const keyboard = { inline_keyboard: [[{ text: '➕ Создать новую', callback_data: `notion_create_${noteText}` }]] };
+      await sendMessage(chatId, `📭 В Notion не найдено страниц по запросу «${escapeHtml(noteText)}».`, keyboard);
+    } else {
+      // Есть результаты – показываем список и кнопку "Создать новую"
+      const list = pages.map(p => `• <a href="${p.url}">${escapeHtml(p.title)}</a>`).join('\n');
+      const keyboard = { inline_keyboard: [[{ text: '➕ Создать новую', callback_data: `notion_create_${noteText}` }]] };
+      await sendMessage(chatId, `📖 <b>Найдено в Notion:</b>\n${list}`, keyboard);
+    }
     return;
   }
   if (text === '/clear') {
@@ -813,7 +812,7 @@ async function handleUpdate(upd) {
       `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
       `🔍 <b>Поиск:</b> спроси «найди что-то» – поищу в интернете.\n` +
       `📋 <b>Команды:</b>\n` +
-      `/notion [текст] – поиск или создание заметки в Notion.\n` +
+      `/notion [текст] – сначала ищет в Notion; если пусто – предлагает создать.\n` +
       `/todo [текст] – добавить задачу в Notion (без ИИ).\n` +
       `/note [текст] – добавить заметку в Notion (без ИИ).\n` +
       `/remind [время] [текст] – установить напоминание.\n` +
@@ -830,7 +829,7 @@ async function handleUpdate(upd) {
     return;
   }
 
-  // Основной диалог
+  // Основной диалог (надёжный стрим без промежуточных правок)
   try {
     await makeRequest(`${TG_API}/sendChatAction`, 'POST', {}, { chat_id: chatId, action: 'typing' });
 
@@ -850,17 +849,27 @@ async function handleUpdate(upd) {
       { role: 'user', content: text + searchContext }
     ];
 
-    // Вызываем DeepSeek
-    const { reasoning, answer } = await callDeepSeek(messages);
-    if (!answer && !reasoning) {
-      await sendMessage(chatId, '⚠️ Не удалось получить ответ от AI.');
+    // Показываем, что думаем
+    const thinkMsg = await sendMessage(chatId, '🧠 <i>Думаю…</i>');
+    const { reasoning, answer, timedOut } = await streamDeepSeek(messages);
+
+    if (timedOut || (!reasoning && !answer)) {
+      await sendMessage(chatId, '⚠️ AI не ответил вовремя. Попробуй позже.');
       return;
     }
 
     const formatted = formatAiResponse(reasoning, answer);
-    await sendMessage(chatId, formatted);
+    const chunks = [];
+    for (let i = 0; i < formatted.length; i += 4000) chunks.push(formatted.slice(i, i+4000));
+    for (let i = 0; i < chunks.length; i++) {
+      if (i === 0 && thinkMsg) {
+        await editMessage(chatId, thinkMsg, chunks[0]);
+      } else {
+        await sendMessage(chatId, chunks[i]);
+      }
+    }
 
-    // Сохраняем историю
+    // История
     if (!chatHistories[chatId]) chatHistories[chatId] = [];
     const hist = chatHistories[chatId];
     hist.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
@@ -889,31 +898,22 @@ function getFactsJSON() {
   if (!facts.length || !facts[0].values) return [];
   return facts[0].values.map(row => ({ id: row[0], text: row[1], ts: row[2] }));
 }
-
 function getRemindersJSON() {
   const reminders = db.exec('SELECT id, chat_id, message, remind_at FROM reminders ORDER BY remind_at');
   if (!reminders.length || !reminders[0].values) return [];
   return reminders[0].values.map(row => ({
-    id: row[0],
-    chat_id: row[1],
-    message: row[2],
-    remind_at: row[3],
+    id: row[0], chat_id: row[1], message: row[2], remind_at: row[3],
     date: new Date(row[3] * 1000).toLocaleString('ru-RU')
   }));
 }
-
 function getHistoryJSON(chatId, limit = 50) {
   const rows = db.exec(`SELECT id, chat_id, role, content, timestamp FROM history WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ${limit}`, { chatId });
   if (!rows.length || !rows[0].values) return [];
   return rows[0].values.map(row => ({
-    id: row[0],
-    role: row[2],
-    content: row[3],
-    timestamp: row[4],
+    id: row[0], role: row[2], content: row[3], timestamp: row[4],
     date: new Date(row[4] * 1000).toLocaleString('ru-RU')
   }));
 }
-
 function servePanel(req, res) {
   const parsed = url.parse(req.url, true);
   const token = parsed.query.token;
@@ -922,38 +922,28 @@ function servePanel(req, res) {
     res.end('Доступ запрещён. Добавьте ?token=...');
     return;
   }
-
   if (parsed.pathname === '/panel') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getPanelHTML());
     return;
   }
-
-  // Факты
+  // API факты
   if (parsed.pathname === '/api/facts') {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getFactsJSON()));
     } else if (req.method === 'POST') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
+      let body = ''; req.on('data', c => body += c); req.on('end', () => {
         try {
           const { text } = JSON.parse(body);
           if (!text || !text.trim()) throw new Error('Пустой текст');
-          const success = addFact(text.trim());
-          if (!success) throw new Error('Дубликат');
+          if (!addFact(text.trim())) throw new Error('Дубликат');
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
-        } catch (e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
-        }
+        } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.message })); }
       });
     } else if (req.method === 'DELETE') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
+      let body = ''; req.on('data', c => body += c); req.on('end', () => {
         try {
           const { id } = JSON.parse(body);
           db.run('DELETE FROM facts WHERE id = ?', [id]);
@@ -962,316 +952,55 @@ function servePanel(req, res) {
           factsStore = facts[0]?.values?.map(row => ({ id: row[0], text: row[1], ts: row[2], _tokens: null })) || [];
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
-        } catch (e) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: e.message }));
-        }
+        } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
       });
     }
     return;
   }
-
-  // Напоминания
+  // API напоминания
   if (parsed.pathname === '/api/reminders') {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getRemindersJSON()));
     } else if (req.method === 'POST') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
+      let body = ''; req.on('data', c => body += c); req.on('end', () => {
         try {
           const { text } = JSON.parse(body);
           if (!text || !text.trim()) throw new Error('Пустой текст');
           const parsed = parseReminderTime('/remind ' + text);
           if (!parsed) throw new Error('Не удалось распознать дату/время');
-          const chatId = ALLOWED_USER_ID;
           db.run('INSERT INTO reminders (chat_id, message, remind_at) VALUES (?, ?, ?)', [
-            chatId,
-            parsed.message,
-            Math.floor(parsed.date.getTime() / 1000)
+            ALLOWED_USER_ID, parsed.message, Math.floor(parsed.date.getTime() / 1000)
           ]);
           saveDatabase();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, date: parsed.date.toLocaleString('ru-RU'), message: parsed.message }));
-        } catch (e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
-        }
+        } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.message })); }
       });
     } else if (req.method === 'DELETE') {
-      let body = '';
-      req.on('data', c => body += c);
-      req.on('end', () => {
+      let body = ''; req.on('data', c => body += c); req.on('end', () => {
         try {
           const { id } = JSON.parse(body);
           db.run('DELETE FROM reminders WHERE id = ?', [id]);
           saveDatabase();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
-        } catch (e) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: e.message }));
-        }
+        } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
       });
     }
     return;
   }
-
-  // История
+  // API история
   if (parsed.pathname === '/api/history') {
     const chatId = parsed.query.chat_id || ALLOWED_USER_ID;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(getHistoryJSON(chatId)));
     return;
   }
-
-  res.writeHead(404);
-  res.end('Not found');
+  res.writeHead(404); res.end('Not found');
 }
-
 function getPanelHTML() {
-  return `<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Панель бота</title>
-  <style>
-    :root {
-      --bg: #1e1e2e;
-      --surface: #2a2a3c;
-      --text: #e0e0e0;
-      --text-secondary: #a0a0b0;
-      --accent: #7c8cf8;
-      --danger: #e74c3c;
-      --border: #3a3a4e;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      padding: 20px;
-      min-height: 100vh;
-    }
-    h1 { font-size: 1.8rem; margin-bottom: 1rem; color: #fff; }
-    .tabs { display: flex; gap: 5px; margin-bottom: 20px; }
-    .tab {
-      padding: 10px 20px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px 8px 0 0;
-      cursor: pointer;
-      color: var(--text-secondary);
-      font-weight: 500;
-      transition: 0.2s;
-    }
-    .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-    .content {
-      background: var(--surface);
-      padding: 20px;
-      border-radius: 0 8px 8px 8px;
-      border: 1px solid var(--border);
-      min-height: 300px;
-    }
-    .hidden { display: none; }
-    .item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .item span { flex: 1; margin-right: 10px; }
-    .item button {
-      background: var(--danger);
-      color: white;
-      border: none;
-      padding: 4px 12px;
-      border-radius: 5px;
-      cursor: pointer;
-      font-size: 0.9rem;
-    }
-    .add-form {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-    .add-form input {
-      flex: 1;
-      padding: 10px 15px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--text);
-      font-size: 1rem;
-    }
-    .add-form button {
-      padding: 10px 20px;
-      border-radius: 8px;
-      border: none;
-      background: var(--accent);
-      color: white;
-      font-weight: bold;
-      cursor: pointer;
-      transition: 0.2s;
-    }
-    .add-form button:hover { opacity: 0.9; }
-    .empty { color: var(--text-secondary); text-align: center; padding: 40px 0; }
-    .history-item { padding: 8px 0; border-bottom: 1px solid var(--border); }
-    .history-role { font-weight: bold; color: var(--accent); text-transform: capitalize; }
-    .history-content { margin: 4px 0 0 10px; color: var(--text); }
-    .history-date { font-size: 0.8rem; color: var(--text-secondary); }
-  </style>
-</head>
-<body>
-  <h1>🤖 Панель управления</h1>
-  <div class="tabs">
-    <div class="tab active" onclick="showTab('facts')">Факты</div>
-    <div class="tab" onclick="showTab('reminders')">Напоминания</div>
-    <div class="tab" onclick="showTab('history')">История</div>
-  </div>
-  <div id="facts" class="content">
-    <div class="add-form">
-      <input id="factInput" type="text" placeholder="Новый факт...">
-      <button onclick="addFact()">➕ Добавить</button>
-    </div>
-    <div id="factList"></div>
-  </div>
-  <div id="reminders" class="content hidden">
-    <div class="add-form">
-      <input id="reminderText" type="text" placeholder="Например: через 30 минут проверить почту">
-      <button onclick="addReminder()">➕ Добавить</button>
-    </div>
-    <div id="reminderList"></div>
-  </div>
-  <div id="history" class="content hidden"></div>
-
-  <script>
-    const token = new URLSearchParams(location.search).get('token');
-    const BASE = '/api';
-
-    function showTab(name) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelector(\`.tab:nth-child(\${['facts','reminders','history'].indexOf(name)+1})\`).classList.add('active');
-      document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
-      document.getElementById(name).classList.remove('hidden');
-      if (name === 'facts') loadFacts();
-      if (name === 'reminders') loadReminders();
-      if (name === 'history') loadHistory();
-    }
-
-    // Факты
-    async function addFact() {
-      const input = document.getElementById('factInput');
-      const text = input.value.trim();
-      if (!text) return;
-      try {
-        const res = await fetch(\`\${BASE}/facts?token=\${token}\`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text })
-        });
-        if (!res.ok) { const err = await res.json(); alert(err.error || 'Ошибка'); return; }
-        input.value = '';
-        await loadFacts();
-      } catch (e) { alert('Ошибка сети'); }
-    }
-
-    async function loadFacts() {
-      try {
-        const res = await fetch(\`\${BASE}/facts?token=\${token}\`);
-        const facts = await res.json();
-        const container = document.getElementById('factList');
-        if (!facts.length) {
-          container.innerHTML = '<div class="empty">🧠 Фактов пока нет</div>';
-          return;
-        }
-        container.innerHTML = facts.map(f =>
-          \`<div class="item"><span>\${escapeHtml(f.text)}</span><button onclick="deleteFact(\${f.id})">🗑</button></div>\`
-        ).join('');
-      } catch (e) { console.error(e); }
-    }
-
-    async function deleteFact(id) {
-      await fetch(\`\${BASE}/facts?token=\${token}\`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
-      });
-      loadFacts();
-    }
-
-    // Напоминания
-    async function addReminder() {
-      const input = document.getElementById('reminderText');
-      const text = input.value.trim();
-      if (!text) return;
-      try {
-        const res = await fetch(\`\${BASE}/reminders?token=\${token}\`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text })
-        });
-        if (!res.ok) { const err = await res.json(); alert(err.error || 'Ошибка'); return; }
-        input.value = '';
-        await loadReminders();
-      } catch (e) { alert('Ошибка сети'); }
-    }
-
-    async function loadReminders() {
-      try {
-        const res = await fetch(\`\${BASE}/reminders?token=\${token}\`);
-        const rems = await res.json();
-        const container = document.getElementById('reminderList');
-        if (!rems.length) {
-          container.innerHTML = '<div class="empty">⏰ Напоминаний нет</div>';
-          return;
-        }
-        container.innerHTML = rems.map(r =>
-          \`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">🗑</button></div>\`
-        ).join('');
-      } catch (e) { console.error(e); }
-    }
-
-    async function deleteReminder(id) {
-      await fetch(\`\${BASE}/reminders?token=\${token}\`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
-      });
-      loadReminders();
-    }
-
-    // История
-    async function loadHistory() {
-      try {
-        const res = await fetch(\`\${BASE}/history?token=\${token}\`);
-        const items = await res.json();
-        const container = document.getElementById('history');
-        if (!items.length) {
-          container.innerHTML = '<div class="empty">📭 История пуста</div>';
-          return;
-        }
-        container.innerHTML = items.map(i =>
-          \`<div class="history-item">
-            <span class="history-role">\${i.role}:</span>
-            <div class="history-content">\${escapeHtml(i.content).substring(0,150)}</div>
-            <div class="history-date">\${i.date}</div>
-          </div>\`
-        ).join('');
-      } catch (e) { console.error(e); }
-    }
-
-    function escapeHtml(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }
-
-    showTab('facts');
-  </script>
-</body>
-</html>`;
+  return `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Панель бота</title><style>:root { --bg: #1e1e2e; --surface: #2a2a3c; --text: #e0e0e0; --text-secondary: #a0a0b0; --accent: #7c8cf8; --danger: #e74c3c; --border: #3a3a4e; } * { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh; } h1 { font-size: 1.8rem; margin-bottom: 1rem; color: #fff; } .tabs { display: flex; gap: 5px; margin-bottom: 20px; } .tab { padding: 10px 20px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px 8px 0 0; cursor: pointer; color: var(--text-secondary); font-weight: 500; transition: 0.2s; } .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); } .content { background: var(--surface); padding: 20px; border-radius: 0 8px 8px 8px; border: 1px solid var(--border); min-height: 300px; } .hidden { display: none; } .item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); } .item span { flex: 1; margin-right: 10px; } .item button { background: var(--danger); color: white; border: none; padding: 4px 12px; border-radius: 5px; cursor: pointer; font-size: 0.9rem; } .add-form { display: flex; gap: 10px; margin-bottom: 20px; } .add-form input { flex: 1; padding: 10px 15px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 1rem; } .add-form button { padding: 10px 20px; border-radius: 8px; border: none; background: var(--accent); color: white; font-weight: bold; cursor: pointer; transition: 0.2s; } .add-form button:hover { opacity: 0.9; } .empty { color: var(--text-secondary); text-align: center; padding: 40px 0; } .history-item { padding: 8px 0; border-bottom: 1px solid var(--border); } .history-role { font-weight: bold; color: var(--accent); text-transform: capitalize; } .history-content { margin: 4px 0 0 10px; color: var(--text); } .history-date { font-size: 0.8rem; color: var(--text-secondary); }</style></head><body><h1>🤖 Панель управления</h1><div class="tabs"><div class="tab active" onclick="showTab('facts')">Факты</div><div class="tab" onclick="showTab('reminders')">Напоминания</div><div class="tab" onclick="showTab('history')">История</div></div><div id="facts" class="content"><div class="add-form"><input id="factInput" type="text" placeholder="Новый факт..."><button onclick="addFact()">➕ Добавить</button></div><div id="factList"></div></div><div id="reminders" class="content hidden"><div class="add-form"><input id="reminderText" type="text" placeholder="Например: через 30 минут проверить почту"><button onclick="addReminder()">➕ Добавить</button></div><div id="reminderList"></div></div><div id="history" class="content hidden"></div><script>const token = new URLSearchParams(location.search).get('token');const BASE = '/api';function showTab(name) {document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));document.querySelector(\`.tab:nth-child(\${['facts','reminders','history'].indexOf(name)+1})\`).classList.add('active');document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));document.getElementById(name).classList.remove('hidden');if (name === 'facts') loadFacts();if (name === 'reminders') loadReminders();if (name === 'history') loadHistory();}async function addFact(){const input=document.getElementById('factInput');const text=input.value.trim();if(!text)return;try{const res=await fetch(\`\${BASE}/facts?token=\${token}\`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});if(!res.ok){const err=await res.json();alert(err.error||'Ошибка');return;}input.value='';await loadFacts();}catch(e){alert('Ошибка сети');}}async function loadFacts(){try{const res=await fetch(\`\${BASE}/facts?token=\${token}\`);const facts=await res.json();const container=document.getElementById('factList');if(!facts.length){container.innerHTML='<div class="empty">🧠 Фактов пока нет</div>';return;}container.innerHTML=facts.map(f=>\`<div class="item"><span>\${escapeHtml(f.text)}</span><button onclick="deleteFact(\${f.id})">🗑</button></div>\`).join('');}catch(e){console.error(e);}}async function deleteFact(id){await fetch(\`\${BASE}/facts?token=\${token}\`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadFacts();}async function addReminder(){const input=document.getElementById('reminderText');const text=input.value.trim();if(!text)return;try{const res=await fetch(\`\${BASE}/reminders?token=\${token}\`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});if(!res.ok){const err=await res.json();alert(err.error||'Ошибка');return;}input.value='';await loadReminders();}catch(e){alert('Ошибка сети');}}async function loadReminders(){try{const res=await fetch(\`\${BASE}/reminders?token=\${token}\`);const rems=await res.json();const container=document.getElementById('reminderList');if(!rems.length){container.innerHTML='<div class="empty">⏰ Напоминаний нет</div>';return;}container.innerHTML=rems.map(r=>\`<div class="item"><span>\${escapeHtml(r.message)} – \${r.date}</span><button onclick="deleteReminder(\${r.id})">🗑</button></div>\`).join('');}catch(e){console.error(e);}}async function deleteReminder(id){await fetch(\`\${BASE}/reminders?token=\${token}\`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadReminders();}async function loadHistory(){try{const res=await fetch(\`\${BASE}/history?token=\${token}\`);const items=await res.json();const container=document.getElementById('history');if(!items.length){container.innerHTML='<div class="empty">📭 История пуста</div>';return;}container.innerHTML=items.map(i=>\`<div class="history-item"><span class="history-role">\${i.role}:</span><div class="history-content">\${escapeHtml(i.content).substring(0,150)}</div><div class="history-date">\${i.date}</div></div>\`).join('');}catch(e){console.error(e);}}function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}showTab('facts');</script></body></html>`;
 }
 
 // ─── Планировщик ──────────────────────────────────────────────────────
@@ -1284,7 +1013,6 @@ async function getOpenTodosFromNotion(limit = 10) {
     return content.split('\n').filter(l => l.trim().startsWith('☐')).map(l => l.replace(/^☐\s*/, '')).filter(Boolean).slice(0, limit);
   } catch (e) { return []; }
 }
-
 async function runMorning() {
   try {
     const todos = await getOpenTodosFromNotion(10);
@@ -1294,7 +1022,6 @@ async function runMorning() {
     await sendMessage(ALLOWED_USER_ID, text);
   } catch (e) { log('ERROR', 'Morning:', e.message); }
 }
-
 async function runEvening() {
   try {
     const todos = await getOpenTodosFromNotion(10);
@@ -1303,7 +1030,6 @@ async function runEvening() {
     await sendMessage(ALLOWED_USER_ID, text);
   } catch (e) { log('ERROR', 'Evening:', e.message); }
 }
-
 function startScheduledTasks() {
   const tz = 'Europe/Chisinau';
   const nowInTz = () => {
@@ -1317,7 +1043,6 @@ function startScheduledTasks() {
     if (hour === 24) hour = 0;
     return { hour, minute: parseInt(o.minute, 10) };
   };
-
   setInterval(async () => {
     await processReminders();
     const { hour, minute } = nowInTz();
@@ -1341,7 +1066,6 @@ const server = http.createServer(async (req, res) => {
   if (parsedUrl.pathname.startsWith('/panel') || parsedUrl.pathname.startsWith('/api/')) {
     return servePanel(req, res);
   }
-
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Бот активен!');
