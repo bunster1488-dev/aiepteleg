@@ -172,24 +172,52 @@ function formatAiResponse(thinking, answer) {
   return res + ans;
 }
 
-// ─── DeepSeek стрим (сбор без редактирования) ─────────────────────────
-function streamDeepSeek(messages) {
+// ─── DeepSeek стрим с живым обновлением сообщения ─────────────────────
+function buildStreamText(reasoning, answer, streaming = false) {
+  const cursor = streaming ? ' ✍️' : '';
+  let out = '';
+  if (reasoning && reasoning.trim()) {
+    out += `🧠 <b>Мысли:</b>\n<blockquote expandable><i>${escapeHtml(reasoning.trim())}${streaming && !answer ? cursor : ''}</i></blockquote>\n\n`;
+  }
+  if (answer) {
+    let a = escapeHtml(answer)
+      .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+      .replace(/`(.*?)`/g, '<code>$1</code>');
+    out += a + cursor;
+  }
+  return out;
+}
+
+async function streamDeepSeek(messages, chatId, thinkMsgId) {
   return new Promise((resolve) => {
-    const url = new URL('https://api.deepseek.com/v1/chat/completions');
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
+    const bodyStr = JSON.stringify({ model: 'deepseek-reasoner', messages, stream: true });
+    let reasoning = '', answer = '', finished = false;
+    let editTimer = null;
+
+    const doEdit = async (final = false) => {
+      if (!thinkMsgId || !chatId) return;
+      const text = buildStreamText(reasoning, answer, !final);
+      if (!text || text === '🧠 <i>Думаю…</i>') return;
+      const t = text.length > 4000 ? text.slice(0, 3997) + '...' : text;
+      await makeRequest(`${TG_API}/editMessageText`, 'POST', {}, {
+        chat_id: chatId, message_id: thinkMsgId, text: t, parse_mode: 'HTML'
+      }).catch(() => {});
+    };
+
+    const req = https.request({
+      hostname: 'api.deepseek.com',
+      path: '/v1/chat/completions',
       method: 'POST',
-      timeout: 30000,
+      timeout: 120000,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+        'Content-Length': Buffer.byteLength(bodyStr)
       }
-    };
-    const req = https.request(options, (res) => {
+    }, (res) => {
       res.setEncoding('utf8');
-      let buffer = '', reasoning = '', answer = '';
+      let buffer = '';
       res.on('data', (chunk) => {
         buffer += chunk;
         const lines = buffer.split('\n');
@@ -202,28 +230,36 @@ function streamDeepSeek(messages) {
           try {
             const json = JSON.parse(data);
             const delta = json.choices?.[0]?.delta || {};
-            if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
-            if (delta.content) { answer += delta.content; }
+            if (delta.reasoning_content) reasoning += delta.reasoning_content;
+            if (delta.content) answer += delta.content;
           } catch (e) {}
         }
+        if (!editTimer) {
+          editTimer = setInterval(() => { if (!finished) doEdit(false); }, 1500);
+        }
       });
-      res.on('end', () => {
+      res.on('end', async () => {
+        finished = true;
+        if (editTimer) { clearInterval(editTimer); editTimer = null; }
+        await doEdit(true);
+        resolve({ reasoning, answer });
+      });
+      res.on('error', async (e) => {
+        finished = true;
+        if (editTimer) { clearInterval(editTimer); editTimer = null; }
+        log('ERROR', 'Stream error:', e.message);
         resolve({ reasoning, answer });
       });
     });
     req.on('timeout', () => {
       req.destroy();
-      resolve({ reasoning: '', answer: '', timedOut: true });
+      resolve({ reasoning, answer, timedOut: true });
     });
     req.on('error', (e) => {
-      log('ERROR', 'Stream error:', e.message);
+      log('ERROR', 'Stream req error:', e.message);
       resolve({ reasoning: '', answer: '' });
     });
-    req.write(JSON.stringify({
-      model: 'deepseek-reasoner',
-      messages,
-      stream: true
-    }));
+    req.write(bodyStr);
     req.end();
   });
 }
@@ -665,6 +701,57 @@ async function handleFileUpload(chatId, message) {
   }
 }
 
+// ─── Умный обработчик /notion ────────────────────────────────────────────
+const notionLocks = new Set();
+async function handleNotion(chatId, userText) {
+  if (!NOTION_TOKEN || !NOTION_PAGE_ID)
+    return '❌ Добавь NOTION_TOKEN и NOTION_PAGE_ID в переменные Render.';
+
+  const lock = userText.trim().toLowerCase();
+  if (notionLocks.has(lock)) return '';
+  notionLocks.add(lock);
+  setTimeout(() => notionLocks.delete(lock), 30000);
+
+  try {
+    const isQuestion = /[?？]/.test(userText) ||
+      /^(что|когда|где|как|кто|сколько|почему|зачем|какой|какая|какие|есть ли|покажи|напомни|расскажи)/i.test(userText.trim());
+
+    const pages = await readNotionPages(userText.replace(/[?！]/g, '').trim());
+
+    if (!pages.length)
+      return isQuestion ? '📭 В Notion нет страниц по этой теме.' : await createNotionPage(userText);
+
+    // Читаем содержимое найденных страниц (включая toggle)
+    const pagesWithContent = await Promise.all(pages.slice(0, 5).map(async p => ({
+      ...p, content: await readNotionPageContent(p.id)
+    })));
+    const fullContext = pagesWithContent.map(p => `=== ${p.title} ===\n${p.content || '(пусто)'}`).join('\n\n');
+
+    const checkRes = await makeRequest('https://api.deepseek.com/v1/chat/completions', 'POST',
+      { Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      { model: 'deepseek-chat', max_tokens: 700, messages: [
+        { role: 'system', content: isQuestion
+          ? 'Найди ответ на вопрос в тексте Notion. Отвечай кратко, укажи из какой страницы. Если нет — скажи честно. Русский язык.'
+          : 'Есть ли уже страница на эту тему? Если ЕСТЬ — ответь: НАЙДЕНО В: [название] и кратко что там. Если НЕТ — ответь: СОЗДАТЬ' },
+        { role: 'user', content: `Запрос: "${userText}"\n\nNotion:\n${fullContext}` }
+      ]}
+    );
+
+    const answer = checkRes?.choices?.[0]?.message?.content?.trim() || '';
+    log('INFO', 'Notion decision:', answer.substring(0, 80));
+
+    if (isQuestion) {
+      const ref = pagesWithContent.find(p => answer.toLowerCase().includes(p.title.toLowerCase().slice(0, 5)));
+      return `📖 <b>Notion:</b>\n\n${answer}${ref ? `\n\n🔗 ${ref.url}` : ''}`;
+    }
+    if (answer.startsWith('НАЙДЕНО В:'))
+      return `📌 ${answer}\n\nЕсли хочешь записать новое — уточни что именно.`;
+    return await createNotionPage(userText);
+  } finally {
+    notionLocks.delete(lock);
+  }
+}
+
 // ─── Основной обработчик обновлений ───────────────────────────────────
 async function handleUpdate(upd) {
   if (upd.callback_query) {
@@ -672,7 +759,6 @@ async function handleUpdate(upd) {
     const chatId = q.message.chat.id.toString();
     const data = q.data;
     await makeRequest(`${TG_API}/answerCallbackQuery`, 'POST', {}, { callback_query_id: q.id });
-
     if (data.startsWith('fact_del_')) {
       const id = parseInt(data.slice('fact_del_'.length));
       db.run('DELETE FROM facts WHERE id = ?', [id]);
@@ -682,10 +768,6 @@ async function handleUpdate(upd) {
       await editMessage(chatId, q.message.message_id, '🗑 Факт удалён.');
     } else if (data === 'fact_add_prompt') {
       await sendMessage(chatId, '✏️ Используйте /facts add <текст> для добавления.');
-    } else if (data.startsWith('notion_create_')) {
-      const userText = data.slice('notion_create_'.length);
-      const pageText = await createNotionPage(userText);
-      await sendMessage(chatId, pageText);
     }
     return;
   }
@@ -780,22 +862,12 @@ async function handleUpdate(upd) {
   if (text.startsWith('/notion')) {
     const noteText = text.replace(/^\/notion[\s\n]?/, '').trim();
     if (!noteText) {
-      await sendMessage(chatId, '✏️ /notion твой текст или идея');
+      await sendMessage(chatId, '✏️ /notion текст — запишу красиво\nИли /notion вопрос? — найду в Notion');
       return;
     }
-
-    // 1. Поиск страниц
-    const pages = await readNotionPages(noteText);
-    if (pages.length === 0) {
-      // Ничего не найдено – предлагаем создать
-      const keyboard = { inline_keyboard: [[{ text: '➕ Создать новую', callback_data: `notion_create_${noteText}` }]] };
-      await sendMessage(chatId, `📭 В Notion не найдено страниц по запросу «${escapeHtml(noteText)}».`, keyboard);
-    } else {
-      // Есть результаты – показываем список и кнопку "Создать новую"
-      const list = pages.map(p => `• <a href="${p.url}">${escapeHtml(p.title)}</a>`).join('\n');
-      const keyboard = { inline_keyboard: [[{ text: '➕ Создать новую', callback_data: `notion_create_${noteText}` }]] };
-      await sendMessage(chatId, `📖 <b>Найдено в Notion:</b>\n${list}`, keyboard);
-    }
+    await sendMessage(chatId, '🔍 Работаю с Notion...');
+    const pageText = await handleNotion(chatId, noteText);
+    await sendMessage(chatId, pageText);
     return;
   }
   if (text === '/clear') {
@@ -812,7 +884,7 @@ async function handleUpdate(upd) {
       `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
       `🔍 <b>Поиск:</b> спроси «найди что-то» – поищу в интернете.\n` +
       `📋 <b>Команды:</b>\n` +
-      `/notion [текст] – сначала ищет в Notion; если пусто – предлагает создать.\n` +
+      `/notion [текст] – поиск или создание заметки в Notion.\n` +
       `/todo [текст] – добавить задачу в Notion (без ИИ).\n` +
       `/note [текст] – добавить заметку в Notion (без ИИ).\n` +
       `/remind [время] [текст] – установить напоминание.\n` +
@@ -849,23 +921,21 @@ async function handleUpdate(upd) {
       { role: 'user', content: text + searchContext }
     ];
 
-    // Показываем, что думаем
-    const thinkMsg = await sendMessage(chatId, '🧠 <i>Думаю…</i>');
-    const { reasoning, answer, timedOut } = await streamDeepSeek(messages);
+    // Отправляем начальное сообщение и запускаем живой стриминг
+    const thinkMsg = await sendMessage(chatId, '⏳');
+    const { reasoning, answer, timedOut } = await streamDeepSeek(messages, chatId, thinkMsg);
 
     if (timedOut || (!reasoning && !answer)) {
-      await sendMessage(chatId, '⚠️ AI не ответил вовремя. Попробуй позже.');
+      await editMessage(chatId, thinkMsg, '⚠️ AI не ответил вовремя. Попробуй позже.');
       return;
     }
 
-    const formatted = formatAiResponse(reasoning, answer);
-    const chunks = [];
-    for (let i = 0; i < formatted.length; i += 4000) chunks.push(formatted.slice(i, i+4000));
-    for (let i = 0; i < chunks.length; i++) {
-      if (i === 0 && thinkMsg) {
-        await editMessage(chatId, thinkMsg, chunks[0]);
-      } else {
-        await sendMessage(chatId, chunks[i]);
+    // Финальный ответ уже вставлен через editMessage внутри streamDeepSeek
+    // Если ответ > 4000 — досылаем хвост отдельными сообщениями
+    const formatted = buildStreamText(reasoning, answer, false);
+    if (formatted.length > 4000) {
+      for (let i = 4000; i < formatted.length; i += 4000) {
+        await sendMessage(chatId, formatted.slice(i, i + 4000));
       }
     }
 
@@ -884,10 +954,9 @@ async function handleUpdate(upd) {
 }
 
 function loadHistoryFromDB(chatId, limit = 30) {
-  const rows = db.exec(`SELECT * FROM history WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ${limit}`, { chatId });
+  const rows = db.exec(`SELECT role, content FROM history WHERE chat_id = '${chatId.replace(/'/g,"''")}' ORDER BY timestamp DESC LIMIT ${limit}`);
   if (!rows.length || !rows[0].values) return [];
-  const reversed = rows[0].values.reverse();
-  return reversed.map(row => ({ role: row[2], content: row[3] }));
+  return rows[0].values.reverse().map(row => ({ role: row[0], content: row[1] }));
 }
 
 // ─── Веб‑панель ────────────────────────────────────────────────────────
