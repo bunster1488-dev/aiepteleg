@@ -172,7 +172,7 @@ function formatAiResponse(thinking, answer) {
   return res + ans;
 }
 
-// ─── DeepSeek стрим (только сбор данных, без редактирования) ──────────
+// ─── DeepSeek стрим (сбор без редактирования) ─────────────────────────
 function streamDeepSeek(messages) {
   return new Promise((resolve) => {
     const url = new URL('https://api.deepseek.com/v1/chat/completions');
@@ -672,6 +672,7 @@ async function handleUpdate(upd) {
     const chatId = q.message.chat.id.toString();
     const data = q.data;
     await makeRequest(`${TG_API}/answerCallbackQuery`, 'POST', {}, { callback_query_id: q.id });
+
     if (data.startsWith('fact_del_')) {
       const id = parseInt(data.slice('fact_del_'.length));
       db.run('DELETE FROM facts WHERE id = ?', [id]);
@@ -681,6 +682,10 @@ async function handleUpdate(upd) {
       await editMessage(chatId, q.message.message_id, '🗑 Факт удалён.');
     } else if (data === 'fact_add_prompt') {
       await sendMessage(chatId, '✏️ Используйте /facts add <текст> для добавления.');
+    } else if (data.startsWith('notion_create_')) {
+      const userText = data.slice('notion_create_'.length);
+      const pageText = await createNotionPage(userText);
+      await sendMessage(chatId, pageText);
     }
     return;
   }
@@ -778,8 +783,19 @@ async function handleUpdate(upd) {
       await sendMessage(chatId, '✏️ /notion твой текст или идея');
       return;
     }
-    const pageText = await createNotionPage(noteText);
-    await sendMessage(chatId, pageText);
+
+    // 1. Поиск страниц
+    const pages = await readNotionPages(noteText);
+    if (pages.length === 0) {
+      // Ничего не найдено – предлагаем создать
+      const keyboard = { inline_keyboard: [[{ text: '➕ Создать новую', callback_data: `notion_create_${noteText}` }]] };
+      await sendMessage(chatId, `📭 В Notion не найдено страниц по запросу «${escapeHtml(noteText)}».`, keyboard);
+    } else {
+      // Есть результаты – показываем список и кнопку "Создать новую"
+      const list = pages.map(p => `• <a href="${p.url}">${escapeHtml(p.title)}</a>`).join('\n');
+      const keyboard = { inline_keyboard: [[{ text: '➕ Создать новую', callback_data: `notion_create_${noteText}` }]] };
+      await sendMessage(chatId, `📖 <b>Найдено в Notion:</b>\n${list}`, keyboard);
+    }
     return;
   }
   if (text === '/clear') {
@@ -796,7 +812,7 @@ async function handleUpdate(upd) {
       `⚡️ <b>Реакции:</b> на короткие фразы («я дома», «спасибо») ставлю эмодзи.\n` +
       `🔍 <b>Поиск:</b> спроси «найди что-то» – поищу в интернете.\n` +
       `📋 <b>Команды:</b>\n` +
-      `/notion [текст] – поиск или создание заметки в Notion.\n` +
+      `/notion [текст] – сначала ищет в Notion; если пусто – предлагает создать.\n` +
       `/todo [текст] – добавить задачу в Notion (без ИИ).\n` +
       `/note [текст] – добавить заметку в Notion (без ИИ).\n` +
       `/remind [время] [текст] – установить напоминание.\n` +
@@ -843,7 +859,6 @@ async function handleUpdate(upd) {
     }
 
     const formatted = formatAiResponse(reasoning, answer);
-    // Отправляем финальный ответ (если было thinkMsg, его можно не удалять, но можно и отредактировать последним куском)
     const chunks = [];
     for (let i = 0; i < formatted.length; i += 4000) chunks.push(formatted.slice(i, i+4000));
     for (let i = 0; i < chunks.length; i++) {
